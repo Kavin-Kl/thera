@@ -1,0 +1,38 @@
+{
+  "name": "thera",
+  "version": "1.0.0",
+  "description": "Desktop therapy agent",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/genai": "^1.48.0",
+    "active-win": "^8.2.1",
+    "better-sqlite3": "^12.8.0",
+    "electron-store": "^11.0.2",
+    "esbuild": "^0.27.7",
+    "framer-motion": "^12.38.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "typewriter-effect": "^2.22.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.2",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.4.27",
+    "electron": "^41.1.1",
+    "electron-rebuild": "^3.2.9",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.2",
+    "vite": "^8.0.1",
+    "vite-plugin-electron": "^0.28.8",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  }
+}
