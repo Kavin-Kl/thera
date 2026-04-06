@@ -25,7 +25,7 @@ function createWindow() {
   // Load the Vite dev server in development or the built files in production
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-    mainWindow.webContents.openDevTools();
+    //mainWindow.webContents.openDevTools();
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
@@ -62,14 +62,16 @@ function createWidgetWindow() {
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width: screenWidth, height: screenHeight } = primaryDisplay.workAreaSize;
 
+  // Window wide enough for expanded nudge, tall enough for multi-line text
+  const W = 400, H = 110;
   const savedPosition = {
-    x: Math.floor((screenWidth - 300) / 2), // Center horizontally
-    y: 0 // Flush with top
+    x: Math.floor((screenWidth - W) / 2), // re-centred for new width
+    y: 0,
   };
 
   widgetWindow = new BrowserWindow({
-    width: 300,
-    height: 32,
+    width: W,
+    height: H,
     x: savedPosition.x,
     y: savedPosition.y,
     frame: false,
@@ -86,17 +88,15 @@ function createWidgetWindow() {
 
   // Load widget HTML
   if (process.env.VITE_DEV_SERVER_URL) {
-    const baseURL = process.env.VITE_DEV_SERVER_URL.replace(/\/$/, ''); // Remove trailing slash
-    const widgetURL = `${baseURL}/widget.html`;
-    console.log('[WIDGET] Loading widget from:', widgetURL);
-    widgetWindow.loadURL(widgetURL);
+    const baseURL = process.env.VITE_DEV_SERVER_URL.replace(/\/$/, '');
+    widgetWindow.loadURL(`${baseURL}/widget.html`);
   } else {
     widgetWindow.loadFile(path.join(__dirname, '../dist/widget.html'));
   }
 
   console.log('[WIDGET] Widget window created at position:', savedPosition);
 
-  // Make window draggable by setting ignore mouse events to false
+  // Always capture mouse events — widget is interactive
   widgetWindow.setIgnoreMouseEvents(false);
 
   // Debug: Log window events
@@ -188,19 +188,25 @@ ipcMain.on('toggle-always-on-top', (event, alwaysOnTop) => {
   if (mainWindow) mainWindow.setAlwaysOnTop(alwaysOnTop);
 });
 
-// Widget click handlers
+// Widget interaction handlers
 ipcMain.on('widget-clicked', () => {
-  // Dismiss nudge on click
-  if (widgetWindow) {
-    widgetWindow.webContents.send('dismiss-nudge');
-  }
+  if (widgetWindow) widgetWindow.webContents.send('dismiss-nudge');
 });
 
 ipcMain.on('widget-long-press', () => {
-  // Open main window on long press
-  if (mainWindow) {
-    mainWindow.show();
-    mainWindow.focus();
+  if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+});
+
+// Drag: move widget window to absolute screen position
+ipcMain.on('move-widget', (_e, { x, y }) => {
+  if (widgetWindow) widgetWindow.setPosition(Math.round(x), Math.round(y));
+});
+
+// Resize widget window (idle ↔ mini chat)
+ipcMain.on('widget-resize', (_e, { height }) => {
+  if (widgetWindow) {
+    const [w] = widgetWindow.getSize();
+    widgetWindow.setSize(w, height);
   }
 });
 

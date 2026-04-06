@@ -4,9 +4,9 @@ var __commonJSMin = (cb, mod) => () => (mod || cb((mod = { exports: {} }).export
 //#region electron/db/localDb.js
 var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	var Database = require("better-sqlite3");
-	var path$1 = require("path");
+	var path$2 = require("path");
 	var { app: app$1 } = require("electron");
-	var dbPath = path$1.join(app$1.getPath("userData"), "thera.db");
+	var dbPath = path$2.join(app$1.getPath("userData"), "thera.db");
 	var db = new Database(dbPath);
 	db.exec(`
   CREATE TABLE IF NOT EXISTS activity_logs (
@@ -111,110 +111,159 @@ var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 //#endregion
 //#region electron/monitors/activityMonitor.js
 var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	var activeWin = require("active-win");
 	var { activityOps, nudgeOps } = require_localDb();
 	var { BrowserWindow: BrowserWindow$1 } = require("electron");
-	var nudgeMessages = {
+	var fs = require("fs");
+	var path$1 = require("path");
+	var _activeWin = null;
+	async function getActiveWindow() {
+		if (!_activeWin) try {
+			const mod = await import("active-win");
+			_activeWin = mod.default ?? mod;
+			console.log("[ACTIVITY] active-win loaded OK");
+		} catch (e) {
+			console.error("[ACTIVITY] Failed to load active-win:", e.message);
+			return null;
+		}
+		try {
+			return await _activeWin();
+		} catch (e) {
+			console.error("[ACTIVITY] active-win() threw:", e.message);
+			return null;
+		}
+	}
+	function readEnvVar(key) {
+		try {
+			const m = fs.readFileSync(path$1.join(__dirname, "../../.env"), "utf8").match(new RegExp(`^${key}=(.+)$`, "m"));
+			return m ? m[1].trim() : "";
+		} catch {
+			return "";
+		}
+	}
+	var GEMINI_API_KEY = readEnvVar("VITE_GEMINI_API_KEY");
+	async function callGemini(prompt) {
+		if (!GEMINI_API_KEY) return null;
+		try {
+			return (await (await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					contents: [{ parts: [{ text: prompt }] }],
+					generationConfig: { maxOutputTokens: 60 }
+				})
+			})).json()).candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+		} catch (e) {
+			console.error("[NUDGE] Gemini fetch failed:", e.message);
+			return null;
+		}
+	}
+	var fallback = {
 		social: [
-			"not judging but you've been on {app} for a while...",
-			"hey. still scrolling? just checking in.",
-			"{app} isn't going anywhere. neither am i.",
+			"not judging but you've been scrolling for a while...",
 			"okay but are you even enjoying this anymore?",
-			"quick break maybe? i'll be here when you're back.",
-			"instagram won't solve this one babe",
-			"twitter drama can wait. you can't.",
-			"doom-scrolling update: still dooming",
-			"what if you just... closed {app}? wild idea i know",
-			"your future self is begging you to stop"
+			"your future self is begging you to stop",
+			"doom-scrolling update: still dooming"
 		],
 		noBreaks: [
-			"you've been staring at {app} for 2 hours straight.",
 			"friendly reminder: you have a body that needs things.",
 			"not to be dramatic but when did you last blink?",
-			"break time. seriously. i insist.",
-			"still there? just making sure you're alive.",
 			"water. movement. please. for me.",
-			"pretty sure you've merged with your chair at this point",
-			"2 hours on {app}. impressive. concerning. but impressive.",
-			"your spine is crying. can you hear it?",
-			"the world will still be here in 5 minutes. promise."
+			"your spine is crying. can you hear it?"
 		]
 	};
-	function getRandomNudge(type, appName) {
-		const messages = nudgeMessages[type] || nudgeMessages.social;
-		return messages[Math.floor(Math.random() * messages.length)].replace("{app}", appName);
+	var pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+	var WATCHED_SITES = [{
+		key: "youtube",
+		match: (t) => t.includes("youtube")
+	}, {
+		key: "instagram",
+		match: (t) => t.includes("instagram")
+	}];
+	function detectSite(title) {
+		const t = (title || "").toLowerCase();
+		return WATCHED_SITES.find((s) => s.match(t)) || null;
+	}
+	async function generateContextualNudge(windowTitle, siteKey) {
+		const aiText = await callGemini(`you're thera — a brutally honest, warm AI companion on the user's desktop.\nthe user just opened: "${windowTitle.replace(/[-|–]\s*youtube\s*$/i, "").replace(/[•|]\s*instagram.*$/i, "").trim() || siteKey}" (${{
+			youtube: "they just opened a youtube video.",
+			instagram: "they opened instagram — probably about to scroll mindlessly."
+		}[siteKey] || siteKey})\n\nwrite ONE nudge. rules:\n- max 12 words, lowercase, no quotes\n- youtube: reference the video title if telling. be dry.\n- instagram: gentle sarcasm, no lecturing.\nrespond with ONLY the nudge, nothing else.`);
+		if (aiText) {
+			console.log(`[NUDGE] AI nudge for ${siteKey}: "${aiText}"`);
+			return aiText.replace(/^["']|["']$/g, "");
+		}
+		return pick(fallback.social);
 	}
 	function categorizeApp(appName, windowTitle) {
-		const app = appName.toLowerCase();
-		const title = (windowTitle || "").toLowerCase();
-		if (app.includes("discord") || app.includes("slack") || app.includes("whatsapp") || app.includes("telegram") || title.includes("twitter") || title.includes("facebook") || title.includes("instagram") || title.includes("tiktok")) return "social";
-		if (app.includes("code") || app.includes("visual studio") || app.includes("intellij") || app.includes("pycharm") || app.includes("webstorm") || app.includes("sublime") || app.includes("atom") || app.includes("vim") || app.includes("terminal") || app.includes("cmd") || app.includes("powershell") || app.includes("cursor")) return "coding";
-		if (app.includes("excel") || app.includes("word") || app.includes("powerpoint") || app.includes("outlook") || app.includes("teams") || app.includes("zoom") || app.includes("meet") || app.includes("notion") || title.includes("jira") || title.includes("asana")) return "work";
-		if (app.includes("spotify") || app.includes("netflix") || app.includes("youtube") || app.includes("steam") || app.includes("game") || app.includes("twitch") || title.includes("youtube") || title.includes("netflix")) return "entertainment";
-		if (app.includes("chrome") || app.includes("firefox") || app.includes("safari") || app.includes("edge") || app.includes("brave") || app.includes("browser")) return "browsing";
+		const a = appName.toLowerCase();
+		const t = (windowTitle || "").toLowerCase();
+		if (a.includes("discord") || a.includes("slack") || a.includes("whatsapp") || t.includes("twitter") || t.includes("instagram") || t.includes("tiktok")) return "social";
+		if (a.includes("code") || a.includes("cursor") || a.includes("terminal") || a.includes("vim") || a.includes("intellij") || a.includes("pycharm")) return "coding";
+		if (a.includes("excel") || a.includes("word") || a.includes("outlook") || a.includes("teams") || a.includes("zoom") || a.includes("notion")) return "work";
+		if (a.includes("spotify") || a.includes("netflix") || a.includes("steam") || t.includes("youtube") || t.includes("netflix") || t.includes("twitch")) return "entertainment";
+		if (a.includes("chrome") || a.includes("firefox") || a.includes("safari") || a.includes("edge") || a.includes("brave")) return "browsing";
 		return "other";
 	}
 	var currentSession = null;
 	var lastActivity = null;
 	var monitorInterval = null;
-	var nudgeChecks = [{
-		type: "doom-scrolling",
-		check: () => {
-			if (!lastActivity) return null;
-			const duration = activityOps.getCategoryDuration("social", 24);
-			console.log("[NUDGE] Checking doom-scrolling: category=social, duration=", duration, "seconds");
-			if (duration > 20 && nudgeOps.shouldNudge("doom-scrolling", 30)) {
-				const appName = currentSession?.app_name || "social media";
-				console.log("[NUDGE] Triggering doom-scrolling nudge for:", appName);
-				return getRandomNudge("social", appName);
-			}
-			return null;
-		}
-	}, {
-		type: "no-breaks",
-		check: () => {
-			if (!lastActivity || !currentSession) return null;
-			const sessionDuration = (Date.now() - lastActivity.started_at) / 1e3;
-			console.log("[NUDGE] Checking no-breaks: sessionDuration=", sessionDuration, "seconds");
-			if (sessionDuration > 30 && nudgeOps.shouldNudge("no-breaks", 45)) {
-				const appName = currentSession?.app_name || "this app";
-				console.log("[NUDGE] Triggering no-breaks nudge for:", appName);
-				return getRandomNudge("noBreaks", appName);
-			}
-			return null;
-		}
-	}];
-	function checkNudges() {
-		nudgeChecks.forEach(({ type, check }) => {
-			const message = check();
-			if (message) sendNudge(type, message);
-		});
-	}
-	function sendNudge(type, messageData) {
-		const message = typeof messageData === "string" ? messageData : getRandomNudge(type, messageData);
-		console.log(`[NUDGE] ${type}: ${message}`);
+	var seenSiteKeys = /* @__PURE__ */ new Set();
+	var siteFirstSeen = /* @__PURE__ */ new Map();
+	function sendNudge(type, message) {
+		console.log(`[NUDGE] ${type}: "${message}"`);
 		nudgeOps.recordNudge(type, message);
-		const widgetWindow = BrowserWindow$1.getAllWindows().find((w) => w.isAlwaysOnTop() && !w.frame);
-		if (widgetWindow) widgetWindow.webContents.send("show-nudge", message);
+		const widget = BrowserWindow$1.getAllWindows().find((w) => w.isAlwaysOnTop() && !w.frame);
+		if (widget) widget.webContents.send("show-nudge", message);
+		else console.warn("[NUDGE] No widget window found to send nudge to");
+	}
+	async function checkNudges() {
+		if (currentSession) {
+			const detected = detectSite(currentSession.window_title);
+			if (detected) {
+				const key = `${currentSession.app_name}::${currentSession.window_title}`;
+				if (!seenSiteKeys.has(key)) {
+					if (!siteFirstSeen.has(key)) siteFirstSeen.set(key, Date.now());
+					const focusedMs = Date.now() - siteFirstSeen.get(key);
+					if (focusedMs < 8e3) return;
+					seenSiteKeys.add(key);
+					siteFirstSeen.delete(key);
+					console.log(`[NUDGE] Site focused >${focusedMs}ms: ${detected.key} — "${currentSession.window_title}"`);
+					sendNudge("site-detection", await generateContextualNudge(currentSession.window_title, detected.key));
+					return;
+				}
+			} else siteFirstSeen.clear();
+		}
+		if (lastActivity) {
+			if (activityOps.getCategoryDuration("social", 24) > 20 && nudgeOps.shouldNudge("doom-scrolling", 30)) {
+				sendNudge("doom-scrolling", pick(fallback.social).replace("{app}", currentSession?.app_name || "that"));
+				return;
+			}
+		}
+		if (currentSession && lastActivity) {
+			if ((Date.now() - lastActivity.started_at) / 1e3 > 30 && nudgeOps.shouldNudge("no-breaks", 45)) {
+				sendNudge("no-breaks", pick(fallback.noBreaks));
+				return;
+			}
+		}
 	}
 	async function pollActiveWindow() {
 		try {
-			const window = await activeWin();
-			if (!window) {
+			const win = await getActiveWindow();
+			if (!win) {
+				console.log("[ACTIVITY] active-win returned null (check Accessibility permissions on macOS)");
 				if (currentSession) {
 					activityOps.endSession(currentSession.id);
-					console.log("[ACTIVITY] Session ended:", currentSession.app_name);
 					currentSession = null;
 				}
 				return;
 			}
-			const { owner: { name: appName }, title: windowTitle } = window;
+			const appName = win.owner?.name || "Unknown";
+			const windowTitle = win.title || "";
 			const category = categorizeApp(appName, windowTitle);
 			if (!currentSession || currentSession.app_name !== appName || currentSession.window_title !== windowTitle) {
 				if (currentSession) {
 					activityOps.endSession(currentSession.id);
-					const duration = (Date.now() - currentSession.started_at) / 1e3;
-					console.log(`[ACTIVITY] Session ended: ${currentSession.app_name} (${Math.round(duration)}s)`);
+					console.log(`[ACTIVITY] Ended: "${currentSession.app_name}" (${currentSession.window_title.slice(0, 60)})`);
 				}
 				currentSession = {
 					id: activityOps.startSession(appName, windowTitle, category),
@@ -223,16 +272,17 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 					category,
 					started_at: Date.now()
 				};
-				console.log(`[ACTIVITY] New session: ${appName} [${category}]`);
+				console.log(`[ACTIVITY] Started: "${appName}" [${category}] — "${windowTitle.slice(0, 80)}"`);
 			}
 			lastActivity = currentSession;
-			checkNudges();
-		} catch (error) {
-			console.error("[ACTIVITY] Error polling window:", error.message);
+			await checkNudges();
+		} catch (e) {
+			console.error("[ACTIVITY] Poll error:", e.message);
 		}
 	}
 	function startMonitoring() {
-		console.log("[ACTIVITY] Starting activity monitor (polling every 10 seconds)");
+		console.log("[ACTIVITY] Monitor started — polling every 10s");
+		setTimeout(() => sendNudge("test", "pipeline check — widget works ✓"), 3e3);
 		pollActiveWindow();
 		monitorInterval = setInterval(pollActiveWindow, 1e4);
 	}
@@ -240,7 +290,7 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		if (monitorInterval) {
 			clearInterval(monitorInterval);
 			if (currentSession) activityOps.endSession(currentSession.id);
-			console.log("[ACTIVITY] Activity monitor stopped");
+			console.log("[ACTIVITY] Monitor stopped");
 		}
 	}
 	startMonitoring();
@@ -272,10 +322,8 @@ function createWindow() {
 			contextIsolation: false
 		}
 	});
-	if (process.env.VITE_DEV_SERVER_URL) {
-		mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-		mainWindow.webContents.openDevTools();
-	} else mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+	if (process.env.VITE_DEV_SERVER_URL) mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+	else mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
 	mainWindow.on("close", (event) => {
 		if (!app.isQuitting) {
 			event.preventDefault();
@@ -294,13 +342,14 @@ function createWindow() {
 function createWidgetWindow() {
 	const { screen } = require("electron");
 	const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
+	const W = 400, H = 110;
 	const savedPosition = {
-		x: Math.floor((screenWidth - 300) / 2),
+		x: Math.floor((screenWidth - W) / 2),
 		y: 0
 	};
 	widgetWindow = new BrowserWindow({
-		width: 300,
-		height: 32,
+		width: W,
+		height: H,
 		x: savedPosition.x,
 		y: savedPosition.y,
 		frame: false,
@@ -315,9 +364,8 @@ function createWidgetWindow() {
 		}
 	});
 	if (process.env.VITE_DEV_SERVER_URL) {
-		const widgetURL = `${process.env.VITE_DEV_SERVER_URL.replace(/\/$/, "")}/widget.html`;
-		console.log("[WIDGET] Loading widget from:", widgetURL);
-		widgetWindow.loadURL(widgetURL);
+		const baseURL = process.env.VITE_DEV_SERVER_URL.replace(/\/$/, "");
+		widgetWindow.loadURL(`${baseURL}/widget.html`);
 	} else widgetWindow.loadFile(path.join(__dirname, "../dist/widget.html"));
 	console.log("[WIDGET] Widget window created at position:", savedPosition);
 	widgetWindow.setIgnoreMouseEvents(false);
@@ -390,6 +438,15 @@ ipcMain.on("widget-long-press", () => {
 	if (mainWindow) {
 		mainWindow.show();
 		mainWindow.focus();
+	}
+});
+ipcMain.on("move-widget", (_e, { x, y }) => {
+	if (widgetWindow) widgetWindow.setPosition(Math.round(x), Math.round(y));
+});
+ipcMain.on("widget-resize", (_e, { height }) => {
+	if (widgetWindow) {
+		const [w] = widgetWindow.getSize();
+		widgetWindow.setSize(w, height);
 	}
 });
 app.whenReady().then(() => {

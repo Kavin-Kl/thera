@@ -3,11 +3,11 @@ import { systemPrompt } from './systemPrompt';
 
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
-export async function sendMessageToAI(conversationHistory, memoryContext = '') {
+export async function sendMessageToAI(conversationHistory, memoryContext = '', customSystemPrompt = null) {
   try {
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-    // Add memory context to system prompt if available
+    const basePrompt = customSystemPrompt ?? systemPrompt;
     const memoryPriming = memoryContext
       ? `\n\n--- MEMORY CONTEXT (things you remember about this person from past conversations) ---\n${memoryContext}\n--- END MEMORY CONTEXT ---\nuse this context naturally. don't explicitly say "i remember you said..." unless it's genuinely relevant. just let it inform how you respond, like a friend who actually pays attention.`
       : '';
@@ -15,11 +15,11 @@ export async function sendMessageToAI(conversationHistory, memoryContext = '') {
     const result = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: [
-        { role: 'user', parts: [{ text: systemPrompt + memoryPriming }] },
+        { role: 'user', parts: [{ text: basePrompt + memoryPriming }] },
         { role: 'model', parts: [{ text: "got it. i'm thera." }] },
         ...conversationHistory,
       ],
-      config: { maxOutputTokens: 2048 },
+      config: { maxOutputTokens: customSystemPrompt ? 256 : 2048 },
     });
 
     return result.text;
