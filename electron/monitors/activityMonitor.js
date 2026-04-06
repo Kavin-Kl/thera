@@ -1,7 +1,20 @@
+/**
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INTELLIGENT ACTIVITY MONITOR v2
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ *
+ * Knows EXACTLY what you're doing and nudges contextually.
+ *
+ * For testing: Fast nudge checks (every 60s) with immediate pattern detection
+ * For production: Slower checks (every 10s) with longer thresholds
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ */
+
 const { activityOps, nudgeOps } = require('../db/localDb');
-const { BrowserWindow }          = require('electron');
-const fs   = require('fs');
-const path = require('path');
+const { BrowserWindow } = require('electron');
+const { detectActivity, detectPattern, analyzeAndDecide } = require('./contextAnalyzer');
+const { captureScreen, shouldCapture } = require('./screenCapture');
 
 /* ── active-win is ESM-only (v8+) — must dynamic-import it ───── */
 let _activeWin = null;
@@ -24,100 +37,29 @@ async function getActiveWindow() {
   }
 }
 
-/* ── Load API key from .env (main process has no import.meta.env) */
-function readEnvVar(key) {
-  try {
-    const raw = fs.readFileSync(path.join(__dirname, '../../.env'), 'utf8');
-    const m   = raw.match(new RegExp(`^${key}=(.+)$`, 'm'));
-    return m ? m[1].trim() : '';
-  } catch { return ''; }
-}
-const GEMINI_API_KEY = readEnvVar('VITE_GEMINI_API_KEY');
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  STATE                                                                 */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-/* ── Gemini via plain fetch (no package needed, Node 18+) ────── */
-async function callGemini(prompt) {
-  if (!GEMINI_API_KEY) return null;
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents:         [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 60 },
-        }),
-      }
-    );
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
-  } catch (e) {
-    console.error('[NUDGE] Gemini fetch failed:', e.message);
-    return null;
-  }
-}
+let currentSession = null;       // { id, app_name, window_title, category, started_at, duration_minutes }
+let sessionHistory = [];          // Last 50 sessions for pattern detection
+let monitorInterval = null;
+let nudgeCheckInterval = null;
+let lastNudgeCheck = 0;
 
-/* ── Fallback nudge bank ─────────────────────────────────────── */
-const fallback = {
-  social:   [
-    "not judging but you've been scrolling for a while...",
-    "okay but are you even enjoying this anymore?",
-    "your future self is begging you to stop",
-    "doom-scrolling update: still dooming",
-  ],
-  noBreaks: [
-    "friendly reminder: you have a body that needs things.",
-    "not to be dramatic but when did you last blink?",
-    "water. movement. please. for me.",
-    "your spine is crying. can you hear it?",
-  ],
-};
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+// TESTING MODE: Fast checks, low thresholds
+const TESTING_MODE = true;
+const POLL_INTERVAL_MS = 5000;                    // Check window every 5s
+const NUDGE_CHECK_INTERVAL_MS = TESTING_MODE ? 60000 : 120000;  // Check for nudges every 60s (testing) / 2min (prod)
 
-/* ── Sites to watch ──────────────────────────────────────────── */
-const WATCHED_SITES = [
-  { key: 'youtube',   match: t => t.includes('youtube')   },
-  { key: 'instagram', match: t => t.includes('instagram') },
-];
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  HELPERS                                                               */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-function detectSite(title) {
-  const t = (title || '').toLowerCase();
-  return WATCHED_SITES.find(s => s.match(t)) || null;
-}
-
-/* ── Generate AI nudge for a detected page ───────────────────── */
-async function generateContextualNudge(windowTitle, siteKey) {
-  const pageContext = windowTitle
-    .replace(/[-|–]\s*youtube\s*$/i, '')
-    .replace(/[•|]\s*instagram.*$/i, '')
-    .trim() || siteKey;
-
-  const hint = {
-    youtube:   'they just opened a youtube video.',
-    instagram: 'they opened instagram — probably about to scroll mindlessly.',
-  };
-
-  const prompt =
-    `you're thera — a brutally honest, warm AI companion on the user's desktop.\n` +
-    `the user just opened: "${pageContext}" (${hint[siteKey] || siteKey})\n\n` +
-    `write ONE nudge. rules:\n` +
-    `- max 12 words, lowercase, no quotes\n` +
-    `- youtube: reference the video title if telling. be dry.\n` +
-    `- instagram: gentle sarcasm, no lecturing.\n` +
-    `respond with ONLY the nudge, nothing else.`;
-
-  const aiText = await callGemini(prompt);
-  if (aiText) {
-    console.log(`[NUDGE] AI nudge for ${siteKey}: "${aiText}"`);
-    return aiText.replace(/^["']|["']$/g, '');
-  }
-  return pick(fallback.social);
-}
-
-/* ── App categorisation ──────────────────────────────────────── */
 function categorizeApp(appName, windowTitle) {
   const a = appName.toLowerCase();
   const t = (windowTitle || '').toLowerCase();
+
   if (a.includes('discord') || a.includes('slack') || a.includes('whatsapp') ||
       t.includes('twitter') || t.includes('instagram') || t.includes('tiktok')) return 'social';
   if (a.includes('code') || a.includes('cursor') || a.includes('terminal') ||
@@ -128,134 +70,161 @@ function categorizeApp(appName, windowTitle) {
       t.includes('youtube') || t.includes('netflix') || t.includes('twitch'))  return 'entertainment';
   if (a.includes('chrome') || a.includes('firefox') || a.includes('safari') ||
       a.includes('edge') || a.includes('brave'))                               return 'browsing';
+
   return 'other';
 }
 
-/* ── State ───────────────────────────────────────────────────── */
-let currentSession  = null;
-let lastActivity    = null;
-let monitorInterval = null;
-const seenSiteKeys   = new Set();   // prevents re-nudging the same tab
-const siteFirstSeen  = new Map();   // key → timestamp when we first saw the site focused
-
-/* ── Send nudge to widget ────────────────────────────────────── */
-function sendNudge(type, message) {
+function sendNudge(type, message, metadata = {}) {
   console.log(`[NUDGE] ${type}: "${message}"`);
+  if (metadata.reasoning) {
+    console.log(`[NUDGE] Reasoning: ${metadata.reasoning}`);
+  }
+
   nudgeOps.recordNudge(type, message);
+
   const widget = BrowserWindow.getAllWindows().find(w => w.isAlwaysOnTop() && !w.frame);
   if (widget) {
     widget.webContents.send('show-nudge', message);
   } else {
-    console.warn('[NUDGE] No widget window found to send nudge to');
+    console.warn('[NUDGE] No widget window found');
   }
 }
 
-/* ── Nudge checks ────────────────────────────────────────────── */
-async function checkNudges() {
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  INTELLIGENT NUDGE SYSTEM                                              */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-  /* 1 — SITE DETECTION
-     Only fires when the tab is the active (foreground) window AND has been
-     focused for at least 8 seconds — prevents nudging on quick tab switches. */
-  if (currentSession) {
-    const detected = detectSite(currentSession.window_title);
-    if (detected) {
-      const key = `${currentSession.app_name}::${currentSession.window_title}`;
+async function checkIntelligentNudges() {
+  if (!currentSession) return;
 
-      if (!seenSiteKeys.has(key)) {
-        // Record first time we see this tab in focus
-        if (!siteFirstSeen.has(key)) {
-          siteFirstSeen.set(key, Date.now());
-        }
+  // Update duration
+  currentSession.duration_minutes = (Date.now() - currentSession.started_at) / 60000;
 
-        const focusedMs = Date.now() - siteFirstSeen.get(key);
-        if (focusedMs < 8000) return; // still in foreground but not long enough yet
+  // Detect activity and patterns
+  const activity = detectActivity(currentSession.app_name, currentSession.window_title);
+  const patterns = detectPattern(sessionHistory, currentSession);
 
-        seenSiteKeys.add(key);
-        siteFirstSeen.delete(key);
-        console.log(`[NUDGE] Site focused >${focusedMs}ms: ${detected.key} — "${currentSession.window_title}"`);
-        const msg = await generateContextualNudge(currentSession.window_title, detected.key);
-        sendNudge('site-detection', msg);
-        return;
-      }
-    } else {
-      // User switched away — clear any pending first-seen timers so
-      // coming back to the same tab resets the 8-second clock
-      siteFirstSeen.clear();
+  console.log('[CONTEXT] Activity:', activity.type, '—', activity.detail);
+  if (patterns.length > 0) {
+    console.log('[CONTEXT] Patterns detected:', patterns.map(p => `${p.type} (${p.severity})`).join(', '));
+  }
+
+  // Check if we should take a screenshot for deeper context
+  let screenshot = null;
+  if (shouldCapture(currentSession, patterns, activity)) {
+    screenshot = await captureScreen();
+    if (screenshot) {
+      console.log('[CONTEXT] Using screenshot for deeper analysis');
     }
   }
 
-  /* 2 — DOOM-SCROLLING (accumulated social time) */
-  if (lastActivity) {
-    const duration = activityOps.getCategoryDuration('social', 24);
-    // TEST: 20s threshold. Production: 30 * 60
-    if (duration > 20 && nudgeOps.shouldNudge('doom-scrolling', 30)) {
-      sendNudge('doom-scrolling', pick(fallback.social).replace('{app}', currentSession?.app_name || 'that'));
-      return;
-    }
-  }
+  // Let AI decide if we should nudge
+  const decision = await analyzeAndDecide(currentSession, sessionHistory, screenshot);
 
-  /* 3 — NO BREAKS (same window too long) */
-  if (currentSession && lastActivity) {
-    const age = (Date.now() - lastActivity.started_at) / 1000;
-    // TEST: 30s threshold. Production: 120 * 60
-    if (age > 30 && nudgeOps.shouldNudge('no-breaks', 45)) {
-      sendNudge('no-breaks', pick(fallback.noBreaks));
-      return;
-    }
+  if (decision.shouldNudge) {
+    sendNudge('intelligent', decision.message, {
+      reasoning: decision.reasoning,
+      ...decision.metadata
+    });
+  } else {
+    console.log('[CONTEXT] No nudge —', decision.reasoning);
   }
 }
 
-/* ── Main poll ───────────────────────────────────────────────── */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  WINDOW TRACKING                                                       */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
 async function pollActiveWindow() {
   try {
     const win = await getActiveWindow();
 
     if (!win) {
-      console.log('[ACTIVITY] active-win returned null (check Accessibility permissions on macOS)');
-      if (currentSession) { activityOps.endSession(currentSession.id); currentSession = null; }
+      console.log('[ACTIVITY] active-win returned null');
+      if (currentSession) {
+        activityOps.endSession(currentSession.id);
+
+        // Add to history
+        const duration_seconds = (Date.now() - currentSession.started_at) / 1000;
+        sessionHistory.push({ ...currentSession, duration_seconds });
+        if (sessionHistory.length > 50) sessionHistory.shift(); // Keep last 50
+
+        currentSession = null;
+      }
       return;
     }
 
-    const appName     = win.owner?.name  || 'Unknown';
-    const windowTitle = win.title        || '';
-    const category    = categorizeApp(appName, windowTitle);
+    const appName = win.owner?.name || 'Unknown';
+    const windowTitle = win.title || '';
+    const category = categorizeApp(appName, windowTitle);
 
+    // New session if app or window changed
     if (!currentSession ||
-        currentSession.app_name     !== appName ||
+        currentSession.app_name !== appName ||
         currentSession.window_title !== windowTitle) {
 
       if (currentSession) {
         activityOps.endSession(currentSession.id);
-        console.log(`[ACTIVITY] Ended: "${currentSession.app_name}" (${currentSession.window_title.slice(0, 60)})`);
+
+        // Add to history
+        const duration_seconds = (Date.now() - currentSession.started_at) / 1000;
+        sessionHistory.push({ ...currentSession, duration_seconds });
+        if (sessionHistory.length > 50) sessionHistory.shift();
+
+        console.log(`[ACTIVITY] Ended: "${currentSession.app_name}" (${Math.floor(duration_seconds)}s)`);
       }
 
       const id = activityOps.startSession(appName, windowTitle, category);
-      currentSession = { id, app_name: appName, window_title: windowTitle, category, started_at: Date.now() };
+      currentSession = {
+        id,
+        app_name: appName,
+        window_title: windowTitle,
+        category,
+        started_at: Date.now(),
+        duration_minutes: 0
+      };
+
       console.log(`[ACTIVITY] Started: "${appName}" [${category}] — "${windowTitle.slice(0, 80)}"`);
     }
-
-    lastActivity = currentSession;
-    await checkNudges();
 
   } catch (e) {
     console.error('[ACTIVITY] Poll error:', e.message);
   }
 }
 
-/* ── Start / stop ────────────────────────────────────────────── */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  START / STOP                                                          */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
 function startMonitoring() {
-  console.log('[ACTIVITY] Monitor started — polling every 10s');
+  console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('[ACTIVITY] Intelligent Activity Monitor v2 — TESTING MODE');
+  console.log('[ACTIVITY] Window polling: every', POLL_INTERVAL_MS / 1000, 'seconds');
+  console.log('[ACTIVITY] Nudge checks: every', NUDGE_CHECK_INTERVAL_MS / 1000, 'seconds');
+  console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-  // TEST: remove once nudges confirmed working
-  setTimeout(() => sendNudge('test', 'pipeline check — widget works ✓'), 3000);
+  // Load recent activity from database to seed history
+  sessionHistory = activityOps.getRecentActivity(1).map(row => ({
+    ...row,
+    duration_minutes: row.duration_seconds / 60
+  }));
+  console.log('[ACTIVITY] Loaded', sessionHistory.length, 'recent sessions from DB');
 
+  // Start polling active window
   pollActiveWindow();
-  monitorInterval = setInterval(pollActiveWindow, 10000);
+  monitorInterval = setInterval(pollActiveWindow, POLL_INTERVAL_MS);
+
+  // Start intelligent nudge checks (separate interval, slower)
+  nudgeCheckInterval = setInterval(checkIntelligentNudges, NUDGE_CHECK_INTERVAL_MS);
+
+  // Also run first nudge check after 30s
+  setTimeout(checkIntelligentNudges, 30000);
 }
 
 function stopMonitoring() {
   if (monitorInterval) {
     clearInterval(monitorInterval);
+    clearInterval(nudgeCheckInterval);
     if (currentSession) activityOps.endSession(currentSession.id);
     console.log('[ACTIVITY] Monitor stopped');
   }
@@ -263,4 +232,5 @@ function stopMonitoring() {
 
 startMonitoring();
 process.on('exit', stopMonitoring);
+
 module.exports = { startMonitoring, stopMonitoring };

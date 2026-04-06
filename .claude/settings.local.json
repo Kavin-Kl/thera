@@ -11,7 +11,8 @@
       "Bash(npx electron-rebuild:*)",
       "Bash(timeout /t 5 /nobreak)",
       "Bash(taskkill /F /PID 857816)",
-      "Bash(timeout /t 3 /nobreak)"
+      "Bash(timeout /t 3 /nobreak)",
+      "Bash(taskkill:*)"
     ],
     "deny": [],
     "ask": []

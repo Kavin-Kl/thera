@@ -96,8 +96,13 @@ function createWidgetWindow() {
 
   console.log('[WIDGET] Widget window created at position:', savedPosition);
 
-  // Always capture mouse events — widget is interactive
-  widgetWindow.setIgnoreMouseEvents(false);
+  // On Windows: forward mouse events through transparent areas, but keep pill/chat interactive
+  // On macOS: the React pointerEvents CSS handles this correctly
+  if (process.platform === 'win32') {
+    widgetWindow.setIgnoreMouseEvents(true, { forward: true });
+  } else {
+    widgetWindow.setIgnoreMouseEvents(false);
+  }
 
   // Debug: Log window events
   widgetWindow.on('closed', () => {
