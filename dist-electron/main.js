@@ -145,7 +145,7 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 			return null;
 		}
 		try {
-			const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`, {
+			const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
@@ -172,7 +172,7 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 	async function callGeminiWithImage(prompt, base64Image, maxTokens = 80) {
 		if (!GEMINI_API_KEY) return null;
 		try {
-			return (await (await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`, {
+			return (await (await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
