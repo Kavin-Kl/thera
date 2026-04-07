@@ -15,6 +15,7 @@ const { activityOps, nudgeOps } = require('../db/localDb');
 const { BrowserWindow } = require('electron');
 const { detectActivity, detectPattern, analyzeAndDecide } = require('./contextAnalyzer');
 const { captureScreen, shouldCapture } = require('./screenCapture');
+const settings = require('../settings');
 
 /* ── active-win is ESM-only (v8+) — must dynamic-import it ───── */
 let _activeWin = null;
@@ -119,7 +120,9 @@ async function checkIntelligentNudges() {
   }
 
   // Let AI decide if we should nudge
-  const decision = await analyzeAndDecide(currentSession, sessionHistory, screenshot);
+  const decision = await analyzeAndDecide(currentSession, sessionHistory, screenshot, {
+    nsfwMode: settings.get('nsfwMode'),
+  });
 
   if (decision.shouldNudge) {
     sendNudge('intelligent', decision.message, {

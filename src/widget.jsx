@@ -85,6 +85,7 @@ function Widget() {
   const [mounted,    setMounted]    = useState(false);
   const [pressing,   setPressing]   = useState(false);
   const [pillDims,   setPillDims]   = useState(null);
+  const [nsfwMode,   setNsfwMode]   = useState(false);
 
   const dismissTimer   = useRef(null);
   const pressTimer     = useRef(null);
@@ -110,6 +111,11 @@ function Widget() {
         if (dismissTimer.current) clearTimeout(dismissTimer.current);
         setNudgeText(null);
       });
+
+      // Load initial NSFW setting
+      ipcRenderer.invoke('get-setting', 'nsfwMode').then(val => {
+        if (val !== undefined) setNsfwMode(!!val);
+      }).catch(() => {});
 
       return () => {
         clearTimeout(t);
@@ -237,6 +243,13 @@ function Widget() {
     if (dismissTimer.current) clearTimeout(dismissTimer.current);
     try { ipcRenderer?.send('widget-clicked'); } catch (_) {}
     setNudgeText(null);
+  };
+
+  const toggleNsfw = (e) => {
+    e.stopPropagation();
+    const next = !nsfwMode;
+    setNsfwMode(next);
+    try { ipcRenderer?.send('set-setting', 'nsfwMode', next); } catch (_) {}
   };
 
   const hasNudge = nudgeText !== null;
@@ -436,18 +449,61 @@ function Widget() {
                   quick chat
                 </span>
               </div>
-              <motion.button
-                onClick={() => setMiniChat(false)}
-                onMouseDown={e => e.stopPropagation()}
-                whileHover={{ scale: 1.15 }} whileTap={{ scale: 0.85 }}
-                style={{
-                  background: 'none', border: 'none', cursor: 'pointer',
-                  color: 'rgba(255,255,255,0.25)', fontFamily: MONO, fontSize: 10,
-                  padding: '2px 4px', lineHeight: 1,
-                }}
-                onMouseEnter={e => e.currentTarget.style.color = 'rgba(255,255,255,0.6)'}
-                onMouseLeave={e => e.currentTarget.style.color = 'rgba(255,255,255,0.25)'}
-              >✕</motion.button>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {/* NSFW toggle */}
+                <motion.button
+                  onClick={toggleNsfw}
+                  onMouseDown={e => e.stopPropagation()}
+                  whileTap={{ scale: 0.88 }}
+                  title={nsfwMode ? 'NSFW on — Thera can swear. click to turn off.' : 'SFW mode — Thera stays clean. click to unleash her.'}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    background: nsfwMode ? 'rgba(232,96,58,0.12)' : 'rgba(255,255,255,0.04)',
+                    border: `0.5px solid ${nsfwMode ? 'rgba(232,96,58,0.35)' : 'rgba(255,255,255,0.1)'}`,
+                    borderRadius: 20, padding: '2px 7px 2px 5px',
+                    cursor: 'pointer', transition: 'all 0.2s',
+                  }}
+                >
+                  {/* pill indicator */}
+                  <div style={{
+                    width: 14, height: 8, borderRadius: 10,
+                    background: nsfwMode ? CORAL : 'rgba(255,255,255,0.12)',
+                    position: 'relative', transition: 'background 0.2s', flexShrink: 0,
+                  }}>
+                    <motion.div
+                      animate={{ x: nsfwMode ? 6 : 0 }}
+                      transition={{ type: 'spring', stiffness: 500, damping: 35 }}
+                      style={{
+                        position: 'absolute', top: 1, left: 1,
+                        width: 6, height: 6, borderRadius: '50%',
+                        background: '#fff',
+                        boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+                      }}
+                    />
+                  </div>
+                  <span style={{
+                    fontFamily: MONO, fontSize: 7.5, letterSpacing: '0.8px',
+                    color: nsfwMode ? CORAL : 'rgba(255,255,255,0.25)',
+                    transition: 'color 0.2s', textTransform: 'uppercase',
+                  }}>
+                    {nsfwMode ? 'nsfw' : 'sfw'}
+                  </span>
+                </motion.button>
+
+                <motion.button
+                  onClick={() => setMiniChat(false)}
+                  onMouseDown={e => e.stopPropagation()}
+                  whileHover={{ scale: 1.15 }} whileTap={{ scale: 0.85 }}
+                  style={{
+                    background: 'none', border: 'none', cursor: 'pointer',
+                    color: 'rgba(255,255,255,0.25)', fontFamily: MONO, fontSize: 10,
+                    padding: '2px 4px', lineHeight: 1,
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.color = 'rgba(255,255,255,0.6)'}
+                  onMouseLeave={e => e.currentTarget.style.color = 'rgba(255,255,255,0.25)'}
+                >✕</motion.button>
+              </div>
             </div>
 
             {/* Response area */}

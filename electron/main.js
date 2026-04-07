@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require('electron');
 const path = require('path');
+const settings = require('./settings');
 
 let mainWindow;
 let widgetWindow;
@@ -214,6 +215,10 @@ ipcMain.on('widget-resize', (_e, { height }) => {
     widgetWindow.setSize(w, height);
   }
 });
+
+// Settings: get and set
+ipcMain.handle('get-setting', (_e, key) => settings.get(key));
+ipcMain.on('set-setting', (_e, key, value) => settings.set(key, value));
 
 app.whenReady().then(() => {
   createWindow();

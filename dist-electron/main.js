@@ -1,6 +1,47 @@
 //#region \0rolldown/runtime.js
 var __commonJSMin = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
 //#endregion
+//#region electron/settings.js
+var require_settings = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	/**
+	* Simple persistent settings for Thera.
+	* Stored as JSON next to the .env in the project root.
+	*/
+	var fs$1 = require("fs");
+	var SETTINGS_PATH = require("path").join(process.cwd(), ".thera-settings.json");
+	var DEFAULTS = { nsfwMode: false };
+	var _settings = { ...DEFAULTS };
+	function load() {
+		try {
+			const raw = fs$1.readFileSync(SETTINGS_PATH, "utf8");
+			_settings = {
+				...DEFAULTS,
+				...JSON.parse(raw)
+			};
+		} catch (_) {}
+	}
+	function save() {
+		try {
+			fs$1.writeFileSync(SETTINGS_PATH, JSON.stringify(_settings, null, 2));
+		} catch (e) {
+			console.error("[SETTINGS] Failed to save:", e.message);
+		}
+	}
+	function get(key) {
+		return key ? _settings[key] : { ..._settings };
+	}
+	function set(key, value) {
+		_settings[key] = value;
+		save();
+		console.log(`[SETTINGS] ${key} = ${value}`);
+	}
+	load();
+	module.exports = {
+		get,
+		set
+	};
+}));
+//#endregion
 //#region electron/db/localDb.js
 var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	var Database = require("better-sqlite3");
@@ -286,7 +327,7 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		const socialTime = sessionHistory.filter((s) => {
 			return detectActivity(s.app_name, s.window_title).type === "social-scrolling" && s.started_at > Date.now() - 3600 * 1e3;
 		}).reduce((sum, s) => sum + (s.duration_seconds || 0), 0) / 60;
-		if (socialTime >= .5) patterns.push({
+		if (socialTime >= .1) patterns.push({
 			type: "doom-scrolling",
 			severity: "medium",
 			detail: `${Math.floor(socialTime)} min on social media`,
@@ -301,14 +342,132 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		});
 		return patterns;
 	}
+	var FALLBACKS = {
+		"doom-scrolling-instagram": {
+			sfw: [
+				"instagram again? they literally design it to trap you, right?",
+				"how many posts have you actually enjoyed in the last 20 minutes?",
+				"you're in the explore feed. that's the danger zone.",
+				"comparing yourself to strangers online? very healthy. love that for you.",
+				"instagram is fine. 40 minutes of it is... a choice.",
+				"still scrolling? the algorithm is winning. just so you know.",
+				"every reel feels like 30 seconds. it's been 35 minutes. math.",
+				"refreshing instagram won't fill the void, but okay.",
+				"you opened instagram 'just to check'. that was a while ago.",
+				"the reels keep coming. you keep watching. who's in charge here?",
+				"genuinely asking: what are you looking for right now?",
+				"you've seen enough strangers' lives today. i promise."
+			],
+			nsfw: [
+				"instagram again? they literally design this to f*ck with your dopamine.",
+				"what the hell are you even looking at anymore.",
+				"you've been scrolling instagram for ages. what is wrong with us.",
+				"babe the explore page is a trap and you walked right in. again.",
+				"comparing yourself to strangers on instagram? jesus christ.",
+				"every reel is 30 seconds and yet somehow 40 minutes just disappeared.",
+				"still scrolling. absolutely unhinged behavior from someone who said 'just a quick check'."
+			]
+		},
+		"doom-scrolling-youtube": {
+			sfw: [
+				"are you sure you wanna watch this video for this long?",
+				"you opened youtube for one video. now you're in the rabbit hole, aren't you.",
+				"that's the 4th autoplay in a row. youtube has you.",
+				"you said 'just one more'. that was 45 minutes ago.",
+				"your watch history is going to be embarrassing. just a heads up.",
+				"the video ended but you're still here. what are we doing.",
+				"youtube autoplay is not your friend. it's really not.",
+				"you've watched enough for today. the internet will still be here tomorrow.",
+				"fascinating how one video becomes a documentary series every time.",
+				"did you come here for something specific? because i think you forgot.",
+				"hour three of youtube. how's that going for you.",
+				"the recommended section is not a to-do list."
+			],
+			nsfw: [
+				"are you seriously still watching youtube? what the hell happened to your plans.",
+				"you literally said 'just one video'. that was an hour ago. come on.",
+				"youtube autoplay is a scam and you fall for it every damn time.",
+				"the rabbit hole got you again. unbelievable. (it's very believable.)",
+				"bro the recommended section is not a homework assignment, stop watching everything.",
+				"your watch history is going to be so embarrassing. just saying."
+			]
+		},
+		"doom-scrolling": {
+			sfw: [
+				"not judging but you've been scrolling for a while...",
+				"okay but are you even enjoying this anymore?",
+				"your future self is silently judging this.",
+				"cool. so we're just... scrolling. no judgment. (some judgment.)",
+				"social media was supposed to be a quick check. lol.",
+				"the scroll continues. as it always does.",
+				"hey. you doing okay in there?"
+			],
+			nsfw: [
+				"what the hell are you scrolling for at this point.",
+				"genuinely: are you okay? because this has been a while.",
+				"the scroll never ends and neither will your regret. kidding. mostly."
+			]
+		},
+		"stuck-editing": {
+			sfw: [
+				"you've been on that for a while. need a fresh pair of eyes?",
+				"still editing? perfection is a myth and a time thief.",
+				"how many times have you rewritten that intro?",
+				"just. send. it.",
+				"done is better than perfect. i know you know that.",
+				"you're editing the same thing on loop. step away for two minutes.",
+				"the document hasn't changed much in 20 minutes. your brain needs a reset."
+			],
+			nsfw: [
+				"you've been editing this for how long? just send the damn thing.",
+				"done is better than perfect. stop rewriting the intro for the fifth f*cking time.",
+				"at what point does editing become procrastination? asking for a friend. (it's now.)"
+			]
+		},
+		"late-night-work": {
+			sfw: [
+				"okay but assignments at 3am? should i be worried?",
+				"working late again. this is becoming a pattern.",
+				"it's late. this better be worth it.",
+				"your sleep schedule is screaming. can you hear it?",
+				"the work will still be there after you sleep. the sleep won't wait forever though.",
+				"late night productivity is a lie your brain tells you. mostly.",
+				"tired + deadline = a special kind of suffering. i see you."
+			],
+			nsfw: [
+				"it's 3am and you're still working. what the hell are you doing to yourself.",
+				"your sleep schedule is absolutely trashed and you're just okay with that?",
+				"tired + deadline is a terrible combination. go to bed. please.",
+				"working this late is genuinely not worth it. i'm serious this time."
+			]
+		}
+	};
+	/**
+	* Pick the right fallback bank based on pattern + current site + nsfwMode
+	*/
+	function pickFallback(patternType, activity, nsfwMode) {
+		const mode = nsfwMode ? "nsfw" : "sfw";
+		let bank;
+		if (patternType === "doom-scrolling") {
+			const detail = (activity.detail || "").toLowerCase();
+			if (detail.includes("instagram")) bank = FALLBACKS["doom-scrolling-instagram"];
+			else if (detail.includes("youtube")) bank = FALLBACKS["doom-scrolling-youtube"];
+			else if (detail.includes("tiktok")) bank = FALLBACKS["doom-scrolling-tiktok"];
+			else bank = FALLBACKS["doom-scrolling"];
+		} else bank = FALLBACKS[patternType];
+		const messages = bank?.[mode] || bank?.sfw || ["hey. take a break maybe?"];
+		return messages[Math.floor(Math.random() * messages.length)];
+	}
 	/**
 	* Decide if we should nudge + generate the message
 	* Returns: { shouldNudge: boolean, message: string, reasoning: string }
 	*/
-	async function analyzeAndDecide(currentSession, sessionHistory, screenshot = null) {
+	async function analyzeAndDecide(currentSession, sessionHistory, screenshot = null, options = {}) {
+		const nsfwMode = options.nsfwMode ?? false;
 		const activity = detectActivity(currentSession.app_name, currentSession.window_title);
 		const patterns = detectPattern(sessionHistory, currentSession);
 		console.log("[CONTEXT] Activity:", activity.type, "—", activity.detail);
+		console.log("[CONTEXT] NSFW mode:", nsfwMode);
 		if (patterns.length > 0) console.log("[CONTEXT] Patterns:", patterns.map((p) => p.type).join(", "));
 		if ([
 			"coding",
@@ -327,53 +486,44 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		const now = /* @__PURE__ */ new Date();
 		const timeContext = `${now.getHours()}:${now.getMinutes().toString().padStart(2, "0")}`;
 		const patternSummary = highSeverityPatterns.map((p) => `${p.type}: ${p.detail}`).join("; ");
+		const detail = activity.detail || "";
+		let siteContext = "";
+		if (detail.toLowerCase().includes("instagram")) siteContext = "specifically on Instagram (reels, explore page, posts)";
+		else if (detail.toLowerCase().includes("youtube")) siteContext = "specifically on YouTube (watching videos, autoplaying, rabbit hole)";
+		else if (detail.toLowerCase().includes("tiktok")) siteContext = "specifically on TikTok (for you page, reels)";
+		else if (detail.toLowerCase().includes("twitter") || detail.toLowerCase().includes("x.com")) siteContext = "specifically on Twitter/X (doom-scrolling the feed)";
+		const swearRule = nsfwMode ? "- you CAN swear occasionally if it feels right (f*ck, hell, damn) — use sparingly, it should feel natural not forced" : "- NO swearing at all — keep it clean but still sarcastic";
 		let prompt = `you're thera — brutally honest, warm AI companion living on this user's desktop.
 
 you've detected concerning patterns. write a nudge.
 
 current situation:
 - time: ${timeContext}
-- activity: ${activity.detail}
+- activity: ${detail}${siteContext ? `\n- site context: ${siteContext}` : ""}
 - patterns detected: ${patternSummary}
 
-write ONE short message (max 12 words, lowercase, no quotes).
+write ONE short message (max 15 words, lowercase, no quotes).
 
 rules:
-- be specific about what you noticed
-- fleabag energy: dry, caring underneath, sarcastic
-- no lectures, no toxic positivity
-- if doom-scrolling: gentle sarcasm about the site/activity
-- if late-night work on assignments: acknowledge the struggle with dark humor
-- if stuck editing: point out how long they've been at it
+- be specific about what you noticed — mention the actual site/app
+- fleabag energy: dry, self-aware, caring underneath, sarcastic
+- no lectures, no toxic positivity, no "have you tried a walk?"
+- if doom-scrolling instagram: call out the explore page / reels / comparison trap specifically
+- if doom-scrolling youtube: call out the rabbit hole / autoplay / "just one more video" thing
+- if doom-scrolling tiktok: call out the for you page / time theft
+- if stuck editing: point out exactly how long they've been at it
+- if late-night work: dark humor about the time + the struggle
+${swearRule}
 
 respond with ONLY the nudge message, nothing else.`;
-		if (screenshot) prompt += "\n\n[screenshot of their screen is attached — use it to understand context better]";
+		if (screenshot) prompt += "\n\n[screenshot of their screen is attached — use it to understand context better and be more specific]";
 		const aiResponse = screenshot ? await callGeminiWithImage(prompt, screenshot, 80) : await callGemini(prompt, 80);
 		console.log("[CONTEXT] AI raw response:", aiResponse);
 		let message;
 		if (!aiResponse || aiResponse === "SKIP" || aiResponse.toLowerCase().includes("skip")) {
 			console.log("[CONTEXT] AI failed or returned SKIP — using fallback message");
-			const messages = {
-				"doom-scrolling": [
-					"not judging but you've been scrolling for a while...",
-					"okay but are you even enjoying this anymore?",
-					"your future self is begging you to stop",
-					"cool. so we're just... scrolling. no judgment."
-				],
-				"stuck-editing": [
-					"you've been on that for a while. need a fresh pair of eyes?",
-					"still editing? you know perfection is a myth right?",
-					"okay but how many times have you rewritten that intro?",
-					"just. send. it."
-				],
-				"late-night-work": [
-					"okay but assignments at 3am? should i be worried?",
-					"working late again. this is becoming a pattern.",
-					"it's 2am. this better be worth it.",
-					"your sleep schedule is screaming. can you hear it?"
-				]
-			}[highSeverityPatterns[0]?.type] || ["hey. take a break maybe?"];
-			message = messages[Math.floor(Math.random() * messages.length)];
+			const patternType = highSeverityPatterns[0]?.type;
+			message = pickFallback(patternType, activity, nsfwMode);
 		} else message = aiResponse.replace(/^["']|["']$/g, "").trim();
 		console.log("[CONTEXT] Final nudge message:", message);
 		return {
@@ -520,6 +670,7 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 	var { BrowserWindow: BrowserWindow$1 } = require("electron");
 	var { detectActivity, detectPattern, analyzeAndDecide } = require_contextAnalyzer();
 	var { captureScreen, shouldCapture } = require_screenCapture();
+	var settings = require_settings();
 	var _activeWin = null;
 	async function getActiveWindow() {
 		if (!_activeWin) try {
@@ -573,7 +724,7 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 			screenshot = await captureScreen();
 			if (screenshot) console.log("[CONTEXT] Using screenshot for deeper analysis");
 		}
-		const decision = await analyzeAndDecide(currentSession, sessionHistory, screenshot);
+		const decision = await analyzeAndDecide(currentSession, sessionHistory, screenshot, { nsfwMode: settings.get("nsfwMode") });
 		if (decision.shouldNudge) sendNudge("intelligent", decision.message, {
 			reasoning: decision.reasoning,
 			...decision.metadata
@@ -660,6 +811,7 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 //#region electron/main.js
 var { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
 var path = require("path");
+var settings = require_settings();
 var mainWindow;
 var widgetWindow;
 var tray;
@@ -806,6 +958,8 @@ ipcMain.on("widget-resize", (_e, { height }) => {
 		widgetWindow.setSize(w, height);
 	}
 });
+ipcMain.handle("get-setting", (_e, key) => settings.get(key));
+ipcMain.on("set-setting", (_e, key, value) => settings.set(key, value));
 app.whenReady().then(() => {
 	createWindow();
 	createWidgetWindow();
