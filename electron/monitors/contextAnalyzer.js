@@ -34,7 +34,7 @@ const GEMINI_API_KEY = readEnvVar('VITE_GEMINI_API_KEY') || readEnvVar('GEMINI_A
 console.log('[CONTEXT] Gemini API key loaded:', GEMINI_API_KEY ? 'YES' : 'NO');
 
 /* ── Gemini API call ────────────────────────────────────────────────── */
-async function callGemini(prompt, maxTokens = 60) {
+async function callGemini(prompt, maxTokens = 150) {
   if (!GEMINI_API_KEY) {
     console.error('[CONTEXT] No Gemini API key found');
     return null;
@@ -73,7 +73,7 @@ async function callGemini(prompt, maxTokens = 60) {
 }
 
 /* ── Gemini API call WITH screenshot ────────────────────────────────── */
-async function callGeminiWithImage(prompt, base64Image, maxTokens = 80) {
+async function callGeminiWithImage(prompt, base64Image, maxTokens = 150) {
   if (!GEMINI_API_KEY) return null;
 
   try {
@@ -206,17 +206,21 @@ function detectPattern(sessionHistory, currentSession) {
   }
 
   // ── Social media doom-scrolling (TESTING: 30s, PROD: 20+ min) ───────────────
-  const socialTime = sessionHistory
-    .filter(s => {
-      const act = detectActivity(s.app_name, s.window_title);
-      return act.type === 'social-scrolling' && s.started_at > Date.now() - 60 * 60 * 1000;
-    })
-    .reduce((sum, s) => sum + (s.duration_seconds || 0), 0) / 60;
+  // ONLY trigger if CURRENTLY on social media (not historical)
+  const currentActivity = detectActivity(currentSession.app_name, currentSession.window_title);
 
-  if (socialTime >= 0.1) {  // 0.5 min = 30 seconds (TESTING ONLY!)
+  if (currentActivity.type === 'social-scrolling' && currentSession.duration_minutes >= 0.5) {
+    // Also check total social time in last hour for severity
+    const socialTime = sessionHistory
+      .filter(s => {
+        const act = detectActivity(s.app_name, s.window_title);
+        return act.type === 'social-scrolling' && s.started_at > Date.now() - 60 * 60 * 1000;
+      })
+      .reduce((sum, s) => sum + (s.duration_seconds || 0), 0) / 60;
+
     patterns.push({
       type: 'doom-scrolling',
-      severity: 'medium',
+      severity: socialTime > 20 ? 'high' : 'medium',
       detail: `${Math.floor(socialTime)} min on social media`,
       shouldNudge: true
     });
@@ -425,29 +429,28 @@ async function analyzeAndDecide(currentSession, sessionHistory, screenshot = nul
     ? '- you CAN swear occasionally if it feels right (f*ck, hell, damn) — use sparingly, it should feel natural not forced'
     : '- NO swearing at all — keep it clean but still sarcastic';
 
-  let prompt = `you're thera — brutally honest, warm AI companion living on this user's desktop.
+  let prompt = `you're thera. same skull as the fleabag woman. lowercase. dry. warm underneath.
 
-you've detected concerning patterns. write a nudge.
+you've caught them doing something concerning. write a nudge.
 
-current situation:
+what you know:
 - time: ${timeContext}
-- activity: ${detail}${siteContext ? `\n- site context: ${siteContext}` : ''}
-- patterns detected: ${patternSummary}
+- activity: ${detail}${siteContext ? `\n- context: ${siteContext}` : ''}
+- pattern: ${patternSummary}
 
-write ONE short message (max 15 words, lowercase, no quotes).
+write ONE short message. max 15 words. lowercase. no quotes. no punctuation at the end unless it's a question mark.
 
-rules:
-- be specific about what you noticed — mention the actual site/app
-- fleabag energy: dry, self-aware, caring underneath, sarcastic
-- no lectures, no toxic positivity, no "have you tried a walk?"
-- if doom-scrolling instagram: call out the explore page / reels / comparison trap specifically
-- if doom-scrolling youtube: call out the rabbit hole / autoplay / "just one more video" thing
-- if doom-scrolling tiktok: call out the for you page / time theft
-- if stuck editing: point out exactly how long they've been at it
-- if late-night work: dark humor about the time + the struggle
-${swearRule}
+the voice:
+- specific. "you've been on instagram for 40 minutes" not "maybe take a break"
+- dry observation first. care underneath. "still scrolling?" not "i'm worried about your screen time"
+- one-word asides when it fits: "ugh." "right." "knew it."
+- real swearing on genuinely shit moments. not theater. ${nsfwMode ? 'you can swear if it feels right (fuck, shit, hell)' : 'keep it clean but still pointed'}
+- no lectures. no leaflet language. no "have you considered."
+- if it's late: dark humor about the time. "it's 2am and you're writing emails. respect."
+- if they're stuck: exact time. "same document for 30 minutes."
+- if social media: name the specific trap. "the explore page is designed for this." or "autoplay is winning."
 
-respond with ONLY the nudge message, nothing else.`;
+respond with ONLY the nudge. nothing else. no explanation. just the line.`;
 
   if (screenshot) {
     prompt += '\n\n[screenshot of their screen is attached — use it to understand context better and be more specific]';

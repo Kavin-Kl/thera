@@ -1,6 +1,11 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require('electron');
 const path = require('path');
 const settings = require('./settings');
+const { sessionOps, messageOps, connectorOps, moodOps, crisisOps } = require('./db/localDb');
+const googleConnector = require('./connectors/google');
+const spotifyConnector = require('./connectors/spotify');
+const slackConnector = require('./connectors/slack');
+const actions = require('./connectors/actions');
 
 let mainWindow;
 let widgetWindow;
@@ -216,11 +221,174 @@ ipcMain.on('widget-resize', (_e, { height }) => {
   }
 });
 
+// Enable/disable mouse event forwarding (for Windows drag fix)
+ipcMain.on('set-widget-interactive', (_e, interactive) => {
+  if (widgetWindow && process.platform === 'win32') {
+    if (interactive) {
+      widgetWindow.setIgnoreMouseEvents(false);
+    } else {
+      widgetWindow.setIgnoreMouseEvents(true, { forward: true });
+    }
+  }
+});
+
 // Settings: get and set
 ipcMain.handle('get-setting', (_e, key) => settings.get(key));
 ipcMain.on('set-setting', (_e, key, value) => settings.set(key, value));
 
+// ── Sessions ──────────────────────────────────────────────────
+ipcMain.handle('sessions:list', () => sessionOps.list());
+ipcMain.handle('sessions:create', (_e, { id, title } = {}) => {
+  const sessionId = id || `thera_${Date.now()}`;
+  return sessionOps.create(sessionId, title || 'new session');
+});
+ipcMain.handle('sessions:rename', (_e, { id, title }) => {
+  sessionOps.rename(id, title);
+  return true;
+});
+ipcMain.handle('sessions:delete', (_e, { id }) => {
+  sessionOps.delete(id);
+  return true;
+});
+ipcMain.handle('sessions:messages', (_e, { id }) => messageOps.listForSession(id));
+ipcMain.handle('sessions:add-message', (_e, { sessionId, role, text }) => {
+  return messageOps.add(sessionId, role, text);
+});
+
+// ── Connectors ────────────────────────────────────────────────
+ipcMain.handle('connectors:list', () => connectorOps.list());
+ipcMain.handle('connectors:upsert', (_e, { key, enabled, status, metadata }) => {
+  connectorOps.upsert(key, { enabled, status, metadata });
+  return connectorOps.get(key);
+});
+
+const GOOGLE_KEYS = ['gmail', 'gcal', 'gcontacts', 'gdrive', 'gdocs', 'gsheets'];
+
+// Sync persisted token state into the connectors table on startup so the UI
+// reflects what's actually authenticated even after a restart.
+function syncConnectorStates() {
+  if (googleConnector.isConnected()) {
+    GOOGLE_KEYS.forEach(k => connectorOps.upsert(k, { enabled: true, status: 'connected' }));
+  }
+  if (spotifyConnector.isConnected()) {
+    connectorOps.upsert('spotify', { enabled: true, status: 'connected' });
+  }
+  if (slackConnector.isConnected()) {
+    connectorOps.upsert('slack', { enabled: true, status: 'connected' });
+  }
+}
+
+ipcMain.handle('connectors:credentials', () => ({
+  google: googleConnector.hasCredentials(),
+  spotify: spotifyConnector.hasCredentials(),
+  slack: slackConnector.hasCredentials(),
+}));
+
+ipcMain.handle('connectors:google:connect', async () => {
+  try {
+    await googleConnector.connect();
+    GOOGLE_KEYS.forEach(k => connectorOps.upsert(k, { enabled: true, status: 'connected' }));
+    return { ok: true };
+  } catch (e) {
+    console.error('[GOOGLE] connect failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('connectors:google:disconnect', async () => {
+  googleConnector.disconnect();
+  GOOGLE_KEYS.forEach(k => connectorOps.upsert(k, { enabled: false, status: 'disconnected' }));
+  return { ok: true };
+});
+
+ipcMain.handle('connectors:spotify:connect', async () => {
+  try {
+    await spotifyConnector.connect();
+    connectorOps.upsert('spotify', { enabled: true, status: 'connected' });
+    return { ok: true };
+  } catch (e) {
+    console.error('[SPOTIFY] connect failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('connectors:spotify:disconnect', () => {
+  spotifyConnector.disconnect();
+  connectorOps.upsert('spotify', { enabled: false, status: 'disconnected' });
+  return { ok: true };
+});
+
+ipcMain.handle('connectors:slack:connect', async () => {
+  try {
+    await slackConnector.connect();
+    connectorOps.upsert('slack', { enabled: true, status: 'connected' });
+    return { ok: true };
+  } catch (e) {
+    console.error('[SLACK] connect failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('connectors:slack:disconnect', () => {
+  slackConnector.disconnect();
+  connectorOps.upsert('slack', { enabled: false, status: 'disconnected' });
+  return { ok: true };
+});
+
+// AI action executor
+ipcMain.handle('actions:execute', (_e, action) => actions.execute(action));
+
+// ── Mood ──────────────────────────────────────────────────────
+ipcMain.handle('mood:log', (_e, entry) => moodOps.log(entry || {}));
+ipcMain.handle('mood:daily', (_e, days) => moodOps.daily(days || 30));
+ipcMain.handle('mood:recent', (_e, limit) => moodOps.recent(limit || 20));
+
+// ── Crisis ────────────────────────────────────────────────────
+ipcMain.handle('crisis:record', (_e, evt) => crisisOps.record(evt || { severity: 'amber' }));
+ipcMain.handle('crisis:resolve', (_e, id) => { crisisOps.resolve(id); return true; });
+ipcMain.handle('crisis:active', () => crisisOps.active());
+
+// ── Weekly roast: pull last 7 days of mood + activity for Gemini to summarize
+ipcMain.handle('roast:context', () => {
+  const moodDays = moodOps.daily(7);
+  const moodRecent = moodOps.recent(50);
+  const activity = require('./db/localDb').activityOps.getRecentActivity(24 * 7);
+  return { moodDays, moodRecent, activity };
+});
+
+// Permission requests
+ipcMain.handle('request-permissions', async () => {
+  const { systemPreferences } = require('electron');
+
+  if (process.platform === 'darwin') {
+    // macOS - request accessibility and screen recording permissions
+    const accessibilityStatus = systemPreferences.getMediaAccessStatus('screen');
+    console.log('[PERMISSIONS] macOS screen recording status:', accessibilityStatus);
+
+    if (accessibilityStatus !== 'granted') {
+      // Open System Preferences
+      const { shell } = require('electron');
+      await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+
+      return {
+        granted: false,
+        platform: 'darwin',
+        message: 'Please grant screen recording permission in System Preferences > Privacy & Security > Screen Recording'
+      };
+    }
+
+    return { granted: true, platform: 'darwin' };
+  } else if (process.platform === 'win32') {
+    // Windows - no special permissions needed, active-win works without prompts
+    console.log('[PERMISSIONS] Windows - no special permissions required');
+    return { granted: true, platform: 'win32' };
+  }
+
+  return { granted: true, platform: 'unknown' };
+});
+
 app.whenReady().then(() => {
+  syncConnectorStates();
   createWindow();
   createWidgetWindow();
   createTray();

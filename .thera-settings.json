@@ -1,3 +1,22 @@
 {
-  "nsfwMode": false
+  "nsfwMode": true,
+  "onboardingData": {
+    "vibe_check": "somewhere between numb and overwhelmed",
+    "want_from_app": [
+      "coping strategies that don't sound like a pamphlet",
+      "someone to vent to at 2am",
+      "i'm not sure yet and that's fine"
+    ],
+    "nsfw_mode": "on — let thera speak freely",
+    "age_group": "18–24",
+    "coping": [
+      "humour. dark humour. very dark humour."
+    ],
+    "tone": "be honest, even if it stings a bit",
+    "struggles": [
+      "i don't have a label for it yet"
+    ],
+    "name": "Kavin"
+  },
+  "onboardingCompleted": true
 }

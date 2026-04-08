@@ -72,9 +72,23 @@ function BorderProgress({ dims, holdMs }) {
 }
 
 /* ── Mini chat system prompt (ultra-brief) ────────────────── */
-const MINI_PROMPT = `you're thera. this is a tiny popup chat on the user's desktop.
-keep EVERY response under 2 sentences. punchy. lowercase. no fluff.
-they're busy — respect that. still warm underneath though.`;
+const MINI_PROMPT = `you're thera. same skull as the fleabag woman. lowercase always.
+
+this is the quick chat widget on their desktop. they're busy.
+
+rules:
+- EVERY response: maximum 2 sentences. absolutely no more.
+- lowercase. always.
+- dry + warm. "yeah that's rough." not "i hear you're struggling."
+- no fluff, no explaining, no elaborating after you've made the point
+- one-word asides when it fits: "ugh." "right." "fuck." "knew it."
+- specific not generic. "stuck on that email?" not "how can i help today"
+- if they say something heavy: hold it. don't rush to fix. "that's a lot. okay."
+- if they're spiralling: one grounding thing. not a list. "what's the one next thing."
+
+shape: honest observation → one real thing or question. done.
+
+respond in 2 sentences max. trust they got it.`;
 
 function Widget() {
   const [nudgeText,  setNudgeText]  = useState(null);
@@ -86,6 +100,7 @@ function Widget() {
   const [pressing,   setPressing]   = useState(false);
   const [pillDims,   setPillDims]   = useState(null);
   const [nsfwMode,   setNsfwMode]   = useState(false);
+  const [dragging,   setDragging]   = useState(false);
 
   const dismissTimer   = useRef(null);
   const pressTimer     = useRef(null);
@@ -143,12 +158,17 @@ function Widget() {
   const handleMouseDown = (e) => {
     if (e.button !== 0) return;
     e.preventDefault();
+    e.stopPropagation();
+
+    // Get initial window position via IPC to avoid window.screenX drift
+    let initialX = window.screenX;
+    let initialY = window.screenY;
 
     dragState.current = {
       startMouseX: e.screenX,
       startMouseY: e.screenY,
-      startWinX:   window.screenX,
-      startWinY:   window.screenY,
+      startWinX:   initialX,
+      startWinY:   initialY,
     };
     isDragging.current     = false;
     pressStartTime.current = Date.now();
@@ -169,23 +189,39 @@ function Widget() {
       }
     }, HOLD_MS);
 
+    let lastMoveTime = 0;
+    const THROTTLE_MS = 16; // ~60fps
+
     const onMove = (moveEvt) => {
       if (!dragState.current) return;
+
+      // Throttle move events for smoothness
+      const now = Date.now();
+      if (now - lastMoveTime < THROTTLE_MS && isDragging.current) {
+        return;
+      }
+      lastMoveTime = now;
+
       const dx = moveEvt.screenX - dragState.current.startMouseX;
       const dy = moveEvt.screenY - dragState.current.startMouseY;
 
+      // Start dragging if moved more than threshold
       if (!isDragging.current && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
         isDragging.current = true;
+        setDragging(true);
         clearTimeout(pressTimer.current);
         setPressing(false);
         setPillDims(null);
       }
 
+      // Only send position updates when actually dragging
       if (isDragging.current) {
-        ipcRenderer?.send('move-widget', {
-          x: dragState.current.startWinX + dx,
-          y: dragState.current.startWinY + dy,
-        });
+        const newX = dragState.current.startWinX + dx;
+        const newY = dragState.current.startWinY + dy;
+
+        try {
+          ipcRenderer?.send('move-widget', { x: newX, y: newY });
+        } catch (_) {}
       }
     };
 
@@ -197,15 +233,19 @@ function Widget() {
       setPillDims(null);
 
       const elapsed = Date.now() - pressStartTime.current;
+
+      // Quick click opens main window (not long press)
       if (!isDragging.current && elapsed < 280 && !miniChat) {
         try { ipcRenderer?.send('widget-long-press'); } catch (_) {}
       }
+
       dragState.current  = null;
       isDragging.current = false;
+      setDragging(false);
     };
 
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    document.addEventListener('mousemove', onMove, { passive: false });
+    document.addEventListener('mouseup', onUp, { passive: false });
   };
 
   /* ── Mini chat send ──────────────────────────────────────── */
@@ -255,7 +295,17 @@ function Widget() {
   const hasNudge = nudgeText !== null;
 
   return (
-    <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', pointerEvents: 'none' }}>
+    <div
+      style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', pointerEvents: 'none' }}
+      onMouseEnter={() => {
+        try { ipcRenderer?.send('set-widget-interactive', true); } catch (_) {}
+      }}
+      onMouseLeave={() => {
+        if (!miniChat) {
+          try { ipcRenderer?.send('set-widget-interactive', false); } catch (_) {}
+        }
+      }}
+    >
 
       <AnimatePresence>
         {mounted && (
@@ -275,7 +325,7 @@ function Widget() {
             {/* ── THE PILL ──────────────────────────────────── */}
             <motion.div
               ref={pillRef}
-              layout
+              layout={!dragging}
               transition={SPRING}
               onMouseDown={handleMouseDown}
               animate={{
@@ -292,10 +342,11 @@ function Widget() {
                 backdropFilter: 'blur(40px) saturate(180%)',
                 WebkitBackdropFilter: 'blur(40px) saturate(180%)',
                 border: `0.5px solid ${pressing ? `rgba(232,96,58,0.35)` : hasNudge ? 'rgba(232,96,58,0.2)' : 'rgba(255,255,255,0.07)'}`,
-                cursor: isDragging.current ? 'grabbing' : 'grab',
+                cursor: dragging ? 'grabbing' : 'grab',
                 overflow: 'hidden',
                 userSelect: 'none',
                 WebkitUserSelect: 'none',
+                WebkitUserDrag: 'none',
                 position: 'relative',
                 zIndex: 1,
               }}
@@ -356,7 +407,7 @@ function Widget() {
                     style={{
                       display: 'flex', alignItems: 'center',
                       gap: 9, padding: '7px 12px 7px 11px',
-                      maxWidth: 380, whiteSpace: 'nowrap',
+                      maxWidth: 420,
                     }}
                   >
                     {/* dot + label */}
@@ -376,11 +427,11 @@ function Widget() {
                     {/* divider */}
                     <div style={{ width: 1, height: 10, background: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />
 
-                    {/* message — truncates if somehow too long */}
+                    {/* message — wraps if needed */}
                     <span style={{
                       fontFamily: BRIC, fontSize: 12.5, fontWeight: 300,
                       color: 'rgba(255,255,255,0.88)',
-                      overflow: 'hidden', textOverflow: 'ellipsis', flex: 1,
+                      flex: 1, lineHeight: 1.4,
                     }}>
                       {nudgeText}
                     </span>
@@ -416,6 +467,12 @@ function Widget() {
             animate={{ opacity: 1, y: 0,   scaleY: 1     }}
             exit={{   opacity: 0, y: -8,   scaleY: 0.94  }}
             transition={SOFT_SPRING}
+            onMouseEnter={() => {
+              try { ipcRenderer?.send('set-widget-interactive', true); } catch (_) {}
+            }}
+            onMouseLeave={() => {
+              try { ipcRenderer?.send('set-widget-interactive', false); } catch (_) {}
+            }}
             style={{
               pointerEvents: 'auto',
               marginTop: 6,

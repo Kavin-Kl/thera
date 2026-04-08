@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { sendMessageToAI } from "../services/aiService";
 import { fetchMemoryContext, storeConversation } from "../services/memoryService";
 
+const { ipcRenderer } = window.require ? window.require('electron') : {};
+
 /* ── Tokens ───────────────────────────────────────────────── */
 const BRIC  = "'Space Grotesk', system-ui, sans-serif";
 const MONO  = "'Space Mono', monospace";
@@ -34,13 +36,6 @@ const reveal = (d = 0) => ({ duration: 0.46, ease: E_OUT, delay: d });
 const soft   = (d = 0) => ({ type: "spring", stiffness: 200, damping: 28, mass: 0.9, delay: d });
 
 /* ── Data ─────────────────────────────────────────────────── */
-const chats = [
-  { id: 1, label: "hi"               },
-  { id: 2, label: "feeling low"      },
-  { id: 3, label: "random thoughts"  },
-  { id: 4, label: "can't sleep"      },
-];
-
 const prompts = [
   "tell me everything.",
   "vent. i'll handle it.",
@@ -63,12 +58,13 @@ function TypingDots() {
 }
 
 /* ═══════════════════════════════════════════════════════════ */
-export default function Home({ dark, setDark }) {
+export default function Home({ dark, setDark, onOpenSettings }) {
   const { BG, SURFACE, BORDER, TEXT, MUTED, DIM } = dark ? DARK : LIGHT;
 
   const [input,      setInput]      = useState("");
   const [messages,   setMessages]   = useState([]);
-  const [activeChat, setActiveChat] = useState(1);
+  const [sessions,   setSessions]   = useState([]);
+  const [activeChat, setActiveChat] = useState(null);
   const [drawer,     setDrawer]     = useState(false);
   const [focused,    setFocused]    = useState(false);
   const [typing,     setTyping]     = useState(false);
@@ -79,20 +75,83 @@ export default function Home({ dark, setDark }) {
   // Temporary userId until we add proper auth
   const userId = 'desktop_user';
 
+  // ── Session loading ────────────────────────────────────────
+  const refreshSessions = async () => {
+    if (!ipcRenderer) return [];
+    const list = await ipcRenderer.invoke('sessions:list');
+    setSessions(list);
+    return list;
+  };
+
+  useEffect(() => {
+    (async () => {
+      const list = await refreshSessions();
+      if (list.length > 0) {
+        // Resume most recent session
+        await loadSession(list[0].id);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const loadSession = async (id) => {
+    if (!ipcRenderer) return;
+    const rows = await ipcRenderer.invoke('sessions:messages', { id });
+    const loaded = rows.map(r => ({ id: r.id, role: r.role, text: r.text }));
+    setMessages(loaded);
+    setActiveChat(id);
+    conversationIdRef.current = id;
+    conversationRef.current = loaded.map(m => ({
+      role: m.role === 'bot' ? 'model' : 'user',
+      parts: [{ text: m.text }],
+    }));
+  };
+
+  const startNewSession = async () => {
+    setMessages([]);
+    setActiveChat(null);
+    conversationIdRef.current = null;
+    conversationRef.current = [];
+    setDrawer(false);
+  };
+
+  const deleteSession = async (id, e) => {
+    e?.stopPropagation();
+    if (!ipcRenderer) return;
+    await ipcRenderer.invoke('sessions:delete', { id });
+    if (id === activeChat) await startNewSession();
+    refreshSessions();
+  };
+
   const send = async () => {
     const text = input.trim();
     if (!text || typing) return;
 
     setInput("");
 
-    // Generate conversation ID if first message
+    // Create session on first message of a new chat
+    let isFirstMessage = false;
     if (!conversationIdRef.current) {
-      conversationIdRef.current = `thera_${userId}_${Date.now()}`;
+      const sid = `thera_${userId}_${Date.now()}`;
+      const title = text.length > 40 ? text.slice(0, 40) + '…' : text;
+      if (ipcRenderer) {
+        await ipcRenderer.invoke('sessions:create', { id: sid, title });
+      }
+      conversationIdRef.current = sid;
+      setActiveChat(sid);
+      isFirstMessage = true;
     }
 
     const newMessages = [...messages, { id: Date.now(), role: "user", text }];
     setMessages(newMessages);
     setTyping(true);
+
+    // Persist user message
+    if (ipcRenderer) {
+      ipcRenderer.invoke('sessions:add-message', {
+        sessionId: conversationIdRef.current, role: 'user', text,
+      });
+    }
 
     // Add user message to conversation history
     conversationRef.current = [
@@ -120,6 +179,15 @@ export default function Home({ dark, setDark }) {
       }];
 
       setMessages(updatedMessages);
+
+      // Persist bot message
+      if (ipcRenderer) {
+        ipcRenderer.invoke('sessions:add-message', {
+          sessionId: conversationIdRef.current, role: 'bot', text: botText,
+        });
+      }
+      if (isFirstMessage) refreshSessions();
+      else refreshSessions(); // touch updated_at ordering
 
       // Store conversation in memory (async, don't wait)
       storeConversation(userId, conversationIdRef.current, updatedMessages);
@@ -193,7 +261,7 @@ export default function Home({ dark, setDark }) {
 
             <motion.button
               whileTap={{ scale: 0.97 }}
-              onClick={() => { setMessages([]); setDrawer(false); }}
+              onClick={startNewSession}
               style={{ width: "100%", textAlign: "left", fontFamily: BRIC, fontSize: 13, fontWeight: 400, color: MUTED, padding: "9px 13px", marginBottom: 24, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 8, cursor: "pointer", transition: "all 0.2s" }}
               onMouseEnter={e => { e.currentTarget.style.color = TEXT; e.currentTarget.style.borderColor = CORAL + "44"; }}
               onMouseLeave={e => { e.currentTarget.style.color = MUTED; e.currentTarget.style.borderColor = BORDER; }}
@@ -206,25 +274,43 @@ export default function Home({ dark, setDark }) {
             </p>
 
             <div style={{ flex: 1, overflowY: "auto" }}>
-              {chats.map((c, i) => {
+              {sessions.length === 0 && (
+                <p style={{ fontFamily: BRIC, fontSize: 12, color: DIM, fontStyle: 'italic', padding: '8px 0' }}>
+                  no chats yet. say something.
+                </p>
+              )}
+              {sessions.map((c, i) => {
                 const active = c.id === activeChat;
                 return (
-                  <motion.button key={c.id}
+                  <motion.div
+                    key={c.id}
                     initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={reveal(i * 0.04)}
-                    whileHover={{ x: 4 }} whileTap={{ scale: 0.97 }}
-                    onClick={() => { setActiveChat(c.id); setDrawer(false); }}
-                    style={{ width: "100%", display: "block", textAlign: "left", fontFamily: BRIC, fontSize: 13.5, fontWeight: active ? 600 : 300, color: active ? CORAL : MUTED, background: "transparent", border: "none", padding: "10px 0", cursor: "pointer", borderBottom: `1px solid ${BORDER}`, transition: "color 0.18s" }}
-                    onMouseEnter={e => { if (!active) e.currentTarget.style.color = TEXT; }}
-                    onMouseLeave={e => { if (!active) e.currentTarget.style.color = MUTED; }}
+                    style={{ display: 'flex', alignItems: 'center', borderBottom: `1px solid ${BORDER}` }}
                   >
-                    {c.label}
-                  </motion.button>
+                    <button
+                      onClick={() => { loadSession(c.id); setDrawer(false); }}
+                      style={{ flex: 1, textAlign: "left", fontFamily: BRIC, fontSize: 13.5, fontWeight: active ? 600 : 300, color: active ? CORAL : MUTED, background: "transparent", border: "none", padding: "10px 0", cursor: "pointer", transition: "color 0.18s", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      onMouseEnter={e => { if (!active) e.currentTarget.style.color = TEXT; }}
+                      onMouseLeave={e => { if (!active) e.currentTarget.style.color = MUTED; }}
+                    >
+                      {c.title}
+                    </button>
+                    <button
+                      onClick={(e) => deleteSession(c.id, e)}
+                      title="delete"
+                      style={{ background: 'transparent', border: 'none', color: DIM, fontSize: 11, cursor: 'pointer', padding: '4px 6px' }}
+                      onMouseEnter={e => e.currentTarget.style.color = CORAL}
+                      onMouseLeave={e => e.currentTarget.style.color = DIM}
+                    >✕</button>
+                  </motion.div>
                 );
               })}
             </div>
 
             <div style={{ paddingTop: 18, borderTop: `1px solid ${BORDER}` }}>
-              <button style={{ fontFamily: BRIC, fontSize: 12, color: DIM, background: "transparent", border: "none", cursor: "pointer", transition: "color 0.18s" }}
+              <button
+                onClick={() => { setDrawer(false); onOpenSettings?.(); }}
+                style={{ fontFamily: BRIC, fontSize: 12, color: DIM, background: "transparent", border: "none", cursor: "pointer", transition: "color 0.18s" }}
                 onMouseEnter={e => e.currentTarget.style.color = MUTED}
                 onMouseLeave={e => e.currentTarget.style.color = DIM}
               >settings</button>

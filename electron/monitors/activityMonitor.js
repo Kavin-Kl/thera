@@ -14,7 +14,7 @@
 const { activityOps, nudgeOps } = require('../db/localDb');
 const { BrowserWindow } = require('electron');
 const { detectActivity, detectPattern, analyzeAndDecide } = require('./contextAnalyzer');
-const { captureScreen, shouldCapture } = require('./screenCapture');
+const { captureScreen } = require('./screenCapture');
 const settings = require('../settings');
 
 /* ── active-win is ESM-only (v8+) — must dynamic-import it ───── */
@@ -46,12 +46,21 @@ let currentSession = null;       // { id, app_name, window_title, category, star
 let sessionHistory = [];          // Last 50 sessions for pattern detection
 let monitorInterval = null;
 let nudgeCheckInterval = null;
+let screenshotInterval = null;
 let lastNudgeCheck = 0;
+let screenshotCache = {
+  periodic: null,        // Latest periodic screenshot (general context)
+  triggered: null,       // Latest triggered screenshot (specific issue)
+  lastPeriodicTime: 0,   // When periodic was last taken
+  lastTriggeredTime: 0   // When triggered was last taken
+};
 
 // TESTING MODE: Fast checks, low thresholds
 const TESTING_MODE = true;
 const POLL_INTERVAL_MS = 5000;                    // Check window every 5s
 const NUDGE_CHECK_INTERVAL_MS = TESTING_MODE ? 60000 : 120000;  // Check for nudges every 60s (testing) / 2min (prod)
+const SCREENSHOT_INTERVAL_MS = TESTING_MODE ? 2 * 60 * 1000 : 15 * 60 * 1000;  // Periodic: every 2min (testing) / 15min (prod)
+const TRIGGER_COOLDOWN_MS = TESTING_MODE ? 30 * 1000 : 5 * 60 * 1000;  // Trigger cooldown: 30s (testing) / 5min (prod)
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 /*  HELPERS                                                               */
@@ -110,13 +119,20 @@ async function checkIntelligentNudges() {
     console.log('[CONTEXT] Patterns detected:', patterns.map(p => `${p.type} (${p.severity})`).join(', '));
   }
 
-  // Check if we should take a screenshot for deeper context
+  // Check if we should take a TRIGGERED screenshot for immediate context
   let screenshot = null;
-  if (shouldCapture(currentSession, patterns, activity)) {
-    screenshot = await captureScreen();
-    if (screenshot) {
-      console.log('[CONTEXT] Using screenshot for deeper analysis');
-    }
+  const shouldTrigger = shouldTakeTriggeredScreenshot(currentSession, patterns, activity);
+
+  if (shouldTrigger) {
+    screenshot = await captureTriggeredScreenshot(activity, patterns);
+  } else if (screenshotCache.triggered && (Date.now() - screenshotCache.lastTriggeredTime < 2 * 60 * 1000)) {
+    // Use recent triggered screenshot if available (within 2 min)
+    screenshot = screenshotCache.triggered;
+    console.log('[CONTEXT] Using recent triggered screenshot');
+  } else if (screenshotCache.periodic) {
+    // Fall back to periodic screenshot for general context
+    screenshot = screenshotCache.periodic;
+    console.log('[CONTEXT] Using periodic screenshot for general context');
   }
 
   // Let AI decide if we should nudge
@@ -131,6 +147,93 @@ async function checkIntelligentNudges() {
     });
   } else {
     console.log('[CONTEXT] No nudge —', decision.reasoning);
+  }
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  HYBRID SCREENSHOT SYSTEM                                             */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/**
+ * Periodic screenshot - captures general context every 15 min
+ * Good for: understanding work patterns, email habits, general productivity
+ */
+async function capturePeriodicScreenshot() {
+  console.log('[SCREENSHOT:PERIODIC] Capturing for general context...');
+  const screenshot = await captureScreen();
+  if (screenshot) {
+    screenshotCache.periodic = screenshot;
+    screenshotCache.lastPeriodicTime = Date.now();
+    console.log('[SCREENSHOT:PERIODIC] Cached:', screenshot.length, 'bytes');
+  } else {
+    console.log('[SCREENSHOT:PERIODIC] Failed to capture');
+  }
+}
+
+/**
+ * Check if we should take a triggered screenshot right now
+ * Triggers:
+ * - Currently doom-scrolling social media 20+ min
+ * - Currently stuck editing/composing 20+ min
+ * - Late night work (11pm-5am)
+ * - Unrecognized app for long time
+ */
+function shouldTakeTriggeredScreenshot(currentSession, patterns, activity) {
+  // Check cooldown - don't spam triggered screenshots
+  const timeSinceLastTrigger = Date.now() - screenshotCache.lastTriggeredTime;
+  if (timeSinceLastTrigger < TRIGGER_COOLDOWN_MS) {
+    return false;
+  }
+
+  // Trigger 1: Currently doom-scrolling
+  if (activity.type === 'social-scrolling' && currentSession.duration_minutes >= 0.5) {
+    console.log('[SCREENSHOT:TRIGGER] Detected: doom-scrolling on', activity.detail);
+    return true;
+  }
+
+  // Trigger 2: Currently stuck on same task
+  if (currentSession.duration_minutes >= 20) {
+    const stuckTypes = ['email-composing', 'document-editing', 'coding'];
+    if (stuckTypes.includes(activity.type)) {
+      console.log('[SCREENSHOT:TRIGGER] Detected: stuck on', activity.type);
+      return true;
+    }
+  }
+
+  // Trigger 3: Late night work
+  const hour = new Date().getHours();
+  const isLateNight = hour >= 23 || hour <= 5;
+  if (isLateNight && currentSession.duration_minutes >= 10) {
+    const workTypes = ['coding', 'document-editing', 'email-composing'];
+    if (workTypes.includes(activity.type)) {
+      console.log('[SCREENSHOT:TRIGGER] Detected: late night work');
+      return true;
+    }
+  }
+
+  // Trigger 4: Unrecognized app for extended time
+  if (activity.type === 'unknown' && currentSession.duration_minutes >= 15) {
+    console.log('[SCREENSHOT:TRIGGER] Detected: unrecognized app');
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Take triggered screenshot for specific concerning behavior
+ */
+async function captureTriggeredScreenshot(activity, patterns) {
+  console.log('[SCREENSHOT:TRIGGER] Capturing for immediate context...');
+  const screenshot = await captureScreen();
+  if (screenshot) {
+    screenshotCache.triggered = screenshot;
+    screenshotCache.lastTriggeredTime = Date.now();
+    console.log('[SCREENSHOT:TRIGGER] Captured:', screenshot.length, 'bytes');
+    return screenshot;
+  } else {
+    console.log('[SCREENSHOT:TRIGGER] Failed to capture');
+    return null;
   }
 }
 
@@ -201,9 +304,11 @@ async function pollActiveWindow() {
 
 function startMonitoring() {
   console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('[ACTIVITY] Intelligent Activity Monitor v2 — TESTING MODE');
+  console.log('[ACTIVITY] Intelligent Activity Monitor v2 — HYBRID SCREENSHOTS');
   console.log('[ACTIVITY] Window polling: every', POLL_INTERVAL_MS / 1000, 'seconds');
   console.log('[ACTIVITY] Nudge checks: every', NUDGE_CHECK_INTERVAL_MS / 1000, 'seconds');
+  console.log('[ACTIVITY] Periodic screenshots: every', SCREENSHOT_INTERVAL_MS / 1000, 'seconds');
+  console.log('[ACTIVITY] Triggered screenshots: when concerning patterns detected');
   console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   // Load recent activity from database to seed history
@@ -220,6 +325,10 @@ function startMonitoring() {
   // Start intelligent nudge checks (separate interval, slower)
   nudgeCheckInterval = setInterval(checkIntelligentNudges, NUDGE_CHECK_INTERVAL_MS);
 
+  // Start periodic screenshot capture (for general context)
+  capturePeriodicScreenshot(); // Capture immediately on start
+  screenshotInterval = setInterval(capturePeriodicScreenshot, SCREENSHOT_INTERVAL_MS);
+
   // Also run first nudge check after 30s
   setTimeout(checkIntelligentNudges, 30000);
 }
@@ -228,7 +337,9 @@ function stopMonitoring() {
   if (monitorInterval) {
     clearInterval(monitorInterval);
     clearInterval(nudgeCheckInterval);
+    clearInterval(screenshotInterval);
     if (currentSession) activityOps.endSession(currentSession.id);
+    screenshotCache = { periodic: null, triggered: null, lastPeriodicTime: 0, lastTriggeredTime: 0 };
     console.log('[ACTIVITY] Monitor stopped');
   }
 }
