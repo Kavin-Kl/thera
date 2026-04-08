@@ -14,7 +14,7 @@ export default defineConfig({
         vite: {
           build: {
             rollupOptions: {
-              external: ['active-win', 'better-sqlite3', 'electron-store'],
+              external: ['active-win', 'better-sqlite3', 'electron-store', 'googleapis'],
             },
           },
         },

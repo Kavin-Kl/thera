@@ -90,7 +90,7 @@ export default function Intro({ onFinish }) {
                       .pauseFor(850)
                       .typeString("<br/><br/>i've heard it all.")
                       .pauseFor(500)
-                      .typeString("<br/>nothing surprises me.")
+                      //.typeString("<br/>nothing surprises me.")
                       .pauseFor(900)
                       .typeString("<br/><br/>your turn.")
                       .pauseFor(580)

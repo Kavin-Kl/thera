@@ -1,5 +1,26 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu } = require('electron');
 const path = require('path');
+const fs = require('fs');
+
+// Load .env before anything else — dotenv v17 is ESM-only so we parse manually
+try {
+  const envPath = path.resolve(__dirname, '../.env');
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx === -1) continue;
+      const key = trimmed.slice(0, idx).trim();
+      const val = trimmed.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (key && !(key in process.env)) process.env[key] = val;
+    }
+  }
+} catch (e) {
+  console.warn('Failed to load .env:', e.message);
+}
+
+const { app, BrowserWindow, ipcMain, Tray, Menu } = require('electron');
 const settings = require('./settings');
 const { sessionOps, messageOps, connectorOps, moodOps, crisisOps } = require('./db/localDb');
 const googleConnector = require('./connectors/google');

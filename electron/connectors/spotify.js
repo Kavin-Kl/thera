@@ -3,7 +3,6 @@
  *
  * Uses raw fetch — no SDK dependency. Tokens auto-refresh on 401.
  */
-require('dotenv').config();
 const tokenStore = require('./tokenStore');
 const { runOAuthFlow } = require('./oauthLoopback');
 

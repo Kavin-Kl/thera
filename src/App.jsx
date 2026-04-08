@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import Intro from "./components/Intro/Intro";
 import Onboarding from "./components/Onboarding/Onboarding";
 import Home from "./Home/Home";
 import Settings from "./components/Settings/Settings";
@@ -9,6 +10,7 @@ const { ipcRenderer } = window.require ? window.require('electron') : {};
 
 function App() {
 
+  const [introDone, setIntroDone] = useState(false);
   const [showHome, setShowHome] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [dark, setDark] = useState(true);
@@ -53,7 +55,13 @@ function App() {
     checkOnboarding();
   }, []);
 
-  // Show nothing while checking settings
+  // Show nothing while checking settings (but after intro)
+  if (!introDone) {
+    return (
+      <Intro onFinish={() => setIntroDone(true)} />
+    );
+  }
+
   if (checkingSettings) {
     return (
       <div style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }} />

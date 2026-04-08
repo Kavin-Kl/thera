@@ -138,13 +138,13 @@ function detectActivity(appName, windowTitle) {
     if (cleanTitle.includes('tutorial') || cleanTitle.includes('learn') || cleanTitle.includes('course')) {
       return { type: 'learning', confidence: 'high', detail: `learning: ${cleanTitle}` };
     }
-    return { type: 'video-watching', confidence: 'medium', detail: cleanTitle };
+    return { type: 'video-watching', confidence: 'medium', detail: `youtube: ${cleanTitle}` };
   }
 
   // ── Instagram / TikTok / Twitter ───────────────────────────────────
-  if (title.includes('instagram') || title.includes('tiktok') || title.includes('twitter') || title.includes('x.com')) {
-    return { type: 'social-scrolling', confidence: 'high', detail: 'scrolling social media' };
-  }
+  if (title.includes('instagram')) return { type: 'social-scrolling', confidence: 'high', detail: 'instagram' };
+  if (title.includes('tiktok'))    return { type: 'social-scrolling', confidence: 'high', detail: 'tiktok' };
+  if (title.includes('twitter') || title.includes('x.com')) return { type: 'social-scrolling', confidence: 'high', detail: 'twitter' };
 
   // ── Google Docs / Sheets ───────────────────────────────────────────
   if (title.includes('google docs') || title.includes('google sheets')) {
@@ -494,6 +494,7 @@ module.exports = {
   detectActivity,
   detectPattern,
   analyzeAndDecide,
+  pickFallback,
   callGemini,
   callGeminiWithImage
 };

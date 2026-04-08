@@ -13,7 +13,7 @@
 
 const { activityOps, nudgeOps } = require('../db/localDb');
 const { BrowserWindow } = require('electron');
-const { detectActivity, detectPattern, analyzeAndDecide } = require('./contextAnalyzer');
+const { detectActivity, detectPattern, analyzeAndDecide, pickFallback } = require('./contextAnalyzer');
 const { captureScreen } = require('./screenCapture');
 const settings = require('../settings');
 
@@ -48,6 +48,11 @@ let monitorInterval = null;
 let nudgeCheckInterval = null;
 let screenshotInterval = null;
 let lastNudgeCheck = 0;
+
+// Fast social nudge (10s) — runs independently of the main intelligent nudge system
+let socialSiteKey = null;   // which social site is currently active
+let socialSiteStart = 0;    // epoch ms when they first landed on it
+let socialNudgeFired = false; // only nudge once per contiguous visit
 let screenshotCache = {
   periodic: null,        // Latest periodic screenshot (general context)
   triggered: null,       // Latest triggered screenshot (specific issue)
@@ -291,6 +296,31 @@ async function pollActiveWindow() {
       };
 
       console.log(`[ACTIVITY] Started: "${appName}" [${category}] — "${windowTitle.slice(0, 80)}"`);
+    }
+
+    // ── Fast social nudge: fire after 10s on any social/video site ────
+    const activity = detectActivity(appName, windowTitle);
+    const isSocial = activity.type === 'social-scrolling' || activity.type === 'video-watching';
+
+    if (isSocial) {
+      const siteKey = activity.detail; // e.g. "scrolling social media" or video title
+      if (siteKey !== socialSiteKey) {
+        // New social site — reset tracker
+        socialSiteKey   = siteKey;
+        socialSiteStart = Date.now();
+        socialNudgeFired = false;
+      } else if (!socialNudgeFired && Date.now() - socialSiteStart >= 5000) {
+        socialNudgeFired = true;
+        console.log('[ACTIVITY] Social 5s threshold hit — nudging');
+        const nsfwMode = settings.get('nsfwMode') ?? false;
+        const message = pickFallback('doom-scrolling', activity, nsfwMode);
+        sendNudge('social-quick', message);
+      }
+    } else {
+      // Left the social site — reset so next visit triggers fresh
+      socialSiteKey    = null;
+      socialSiteStart  = 0;
+      socialNudgeFired = false;
     }
 
   } catch (e) {

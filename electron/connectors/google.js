@@ -5,7 +5,6 @@
  * Tokens are persisted via tokenStore. The exported `getClient()` returns an
  * authorized OAuth2 client ready to pass into googleapis services.
  */
-require('dotenv').config();
 const { google } = require('googleapis');
 const tokenStore = require('./tokenStore');
 const { runOAuthFlow } = require('./oauthLoopback');

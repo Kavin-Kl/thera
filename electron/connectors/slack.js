@@ -1,7 +1,6 @@
 /**
  * Slack OAuth (v2) + thin REST helper.
  */
-require('dotenv').config();
 const tokenStore = require('./tokenStore');
 const { runOAuthFlow } = require('./oauthLoopback');
 
