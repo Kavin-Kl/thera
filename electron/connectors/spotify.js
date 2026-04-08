@@ -24,15 +24,19 @@ async function connect() {
     throw new Error('Spotify OAuth not configured. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to .env');
   }
 
-  let capturedRedirect = null;
+  // Spotify requires exact redirect URI matching — use a fixed port
+  // You must add http://127.0.0.1:8888/oauth/callback to your Spotify app's
+  // Redirect URIs at https://developer.spotify.com/dashboard
+  const REDIRECT_URI = 'http://127.0.0.1:51234/oauth/callback';
+
   const query = await runOAuthFlow({
-    buildAuthUrl: (port) => {
-      capturedRedirect = `http://127.0.0.1:${port}/oauth/callback`;
+    fixedPort: 51234,
+    buildAuthUrl: () => {
       const params = new URLSearchParams({
         response_type: 'code',
         client_id: process.env.SPOTIFY_CLIENT_ID,
         scope: SCOPES,
-        redirect_uri: capturedRedirect,
+        redirect_uri: REDIRECT_URI,
       });
       return `https://accounts.spotify.com/authorize?${params}`;
     },
@@ -41,7 +45,7 @@ async function connect() {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code: query.code,
-    redirect_uri: capturedRedirect,
+    redirect_uri: REDIRECT_URI,
   });
   const auth = Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString('base64');
 

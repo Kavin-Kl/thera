@@ -15,6 +15,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { enrichContext, buildContextSummary } = require('./contextEnricher');
 
 /* ── Read API key from .env ─────────────────────────────────────────── */
 function readEnvVar(key) {
@@ -50,7 +51,11 @@ async function callGemini(prompt, maxTokens = 150) {
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
             maxOutputTokens: maxTokens,
-            temperature: 0.9
+            temperature: 0.9,
+            // gemini-2.5-flash is a thinking model — reasoning tokens count
+            // against maxOutputTokens and were eating our short nudges,
+            // leaving only fragments like ".env at". Disable thinking.
+            thinkingConfig: { thinkingBudget: 0 }
           }
         })
       }
@@ -96,7 +101,8 @@ async function callGeminiWithImage(prompt, base64Image, maxTokens = 150) {
           }],
           generationConfig: {
             maxOutputTokens: maxTokens,
-            temperature: 0.9
+            temperature: 0.9,
+            thinkingConfig: { thinkingBudget: 0 }
           }
         })
       }
@@ -361,6 +367,46 @@ const FALLBACKS = {
 };
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/*  MUSIC LOOP NUDGES                                                    */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+async function generateMusicLoopNudge(loopInfo, nsfwMode) {
+  const prompt = `you're thera. lowercase. dry. warm underneath.
+
+they've been looping "${loopInfo.track}" by ${loopInfo.artist} for ${loopInfo.totalMinutes} minutes (${loopInfo.playCount} plays).
+
+write ONE short observation or question about the song. max 12 words. lowercase. no quotes.
+
+examples:
+- "that song hits different when you're in your feelings huh"
+- "stuck on ${loopInfo.track}. wanna talk about it?"
+- "${loopInfo.playCount} times in a row. respect the dedication"
+- "looping ${loopInfo.artist}. feeling something or just vibing"
+
+${nsfwMode ? 'you can swear if it fits naturally' : 'keep it clean'}
+
+respond with ONLY the nudge. nothing else.`;
+
+  const aiResponse = await callGemini(prompt, 60);
+
+  if (!aiResponse || aiResponse.toLowerCase().includes('skip')) {
+    // Fallback
+    const fallbacks = nsfwMode ? [
+      `${loopInfo.track} on repeat. feeling it or stuck in your head`,
+      `that's ${loopInfo.playCount} plays. the song hits or you're procrastinating`,
+      `looping ${loopInfo.artist}. vibing or spiraling`,
+    ] : [
+      `still on ${loopInfo.track}. that one really speaks to you huh`,
+      `${loopInfo.playCount} times. the song hits different today`,
+      `looping ${loopInfo.artist}. you okay in there`,
+    ];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+
+  return aiResponse.replace(/^["']|["']$/g, '').trim();
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 /*  SMART NUDGE DECISION ENGINE                                          */
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
@@ -400,9 +446,26 @@ async function analyzeAndDecide(currentSession, sessionHistory, screenshot = nul
     console.log('[CONTEXT] Patterns:', patterns.map(p => p.type).join(', '));
   }
 
+  // ── Enrich with real-time context from connectors ─────────────────
+  const enrichedActivity = await enrichContext(activity, currentSession.window_title);
+  const contextSummary = buildContextSummary(enrichedActivity);
+
+  if (contextSummary !== activity.detail) {
+    console.log('[CONTEXT] Enriched context:', contextSummary);
+  }
+
   // ── Quick bailout: don't interrupt deep work ──────────────────────
   const quietActivities = ['coding', 'email-reading', 'chatting', 'entertainment'];
   if (quietActivities.includes(activity.type) && patterns.length === 0) {
+    // EXCEPTION: If Spotify loop detected, nudge about the music
+    if (enrichedActivity.spotifyLoop) {
+      return {
+        shouldNudge: true,
+        message: await generateMusicLoopNudge(enrichedActivity.spotifyLoop, nsfwMode),
+        reasoning: 'spotify loop detected',
+        metadata: { spotifyLoop: enrichedActivity.spotifyLoop }
+      };
+    }
     return { shouldNudge: false, reasoning: 'user is focused, no concerning patterns' };
   }
 
@@ -429,6 +492,22 @@ async function analyzeAndDecide(currentSession, sessionHistory, screenshot = nul
     ? '- you CAN swear occasionally if it feels right (f*ck, hell, damn) — use sparingly, it should feel natural not forced'
     : '- NO swearing at all — keep it clean but still sarcastic';
 
+  // Include enriched context in prompt
+  let enrichedContext = '';
+  if (enrichedActivity.spotify) {
+    const sp = enrichedActivity.spotify;
+    enrichedContext += `\n- spotify: ${sp.isPlaying ? 'playing' : 'paused'} "${sp.track}" by ${sp.artist}`;
+    if (enrichedActivity.spotifyLoop) {
+      enrichedContext += ` (on repeat ${enrichedActivity.spotifyLoop.playCount} times)`;
+    }
+  }
+  if (enrichedActivity.gmail) {
+    enrichedContext += `\n- gmail: drafting to ${enrichedActivity.gmail.to}, subject: "${enrichedActivity.gmail.subject}"`;
+  }
+  if (enrichedActivity.calendar?.isNow) {
+    enrichedContext += `\n- calendar: meeting NOW "${enrichedActivity.calendar.summary}"`;
+  }
+
   let prompt = `you're thera. same skull as the fleabag woman. lowercase. dry. warm underneath.
 
 you've caught them doing something concerning. write a nudge.
@@ -436,7 +515,7 @@ you've caught them doing something concerning. write a nudge.
 what you know:
 - time: ${timeContext}
 - activity: ${detail}${siteContext ? `\n- context: ${siteContext}` : ''}
-- pattern: ${patternSummary}
+- pattern: ${patternSummary}${enrichedContext}
 
 write ONE short message. max 15 words. lowercase. no quotes. no punctuation at the end unless it's a question mark.
 

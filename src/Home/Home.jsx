@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { sendMessageToAI } from "../services/aiService";
+import { processAIResponse } from "../services/actionExecutor";
 import { fetchMemoryContext, storeConversation } from "../services/memoryService";
 
 const { ipcRenderer } = window.require ? window.require('electron') : {};
@@ -164,26 +165,45 @@ export default function Home({ dark, setDark, onOpenSettings }) {
       const memoryContext = await fetchMemoryContext(userId, text);
 
       // Call Gemini API with memory context
-      const botText = await sendMessageToAI(conversationRef.current, memoryContext);
+      const rawBotText = await sendMessageToAI(conversationRef.current, memoryContext);
 
-      // Add bot response to conversation history
+      // Parse + execute any <action>...</action> blocks the AI emitted.
+      // This strips the tags from what the user sees and dispatches each
+      // action (gmail.draft, gmail.send, slack.send, spotify.queue, etc.)
+      // via IPC to the main process.
+      const { displayText, results, resultSummary } = await processAIResponse(rawBotText);
+
+      // What the user actually sees: prose + compact result line(s).
+      const visibleText = results.length > 0
+        ? `${displayText}${displayText ? '\n\n' : ''}${results.map(r => `— ${r.summary}`).join('\n')}`
+        : displayText;
+
+      // What the model sees next turn: its own raw reply (WITH tags so it
+      // remembers what it committed to) followed by a system-style result
+      // line so it can react naturally ("right. drafted. want me to send?")
       conversationRef.current = [
         ...conversationRef.current,
-        { role: 'model', parts: [{ text: botText }] }
+        { role: 'model', parts: [{ text: rawBotText }] },
       ];
+      if (resultSummary) {
+        conversationRef.current.push({
+          role: 'user',
+          parts: [{ text: resultSummary }],
+        });
+      }
 
       const updatedMessages = [...newMessages, {
         id: Date.now() + 1,
         role: "bot",
-        text: botText,
+        text: visibleText,
       }];
 
       setMessages(updatedMessages);
 
-      // Persist bot message
+      // Persist bot message (the user-visible version)
       if (ipcRenderer) {
         ipcRenderer.invoke('sessions:add-message', {
-          sessionId: conversationIdRef.current, role: 'bot', text: botText,
+          sessionId: conversationIdRef.current, role: 'bot', text: visibleText,
         });
       }
       if (isFirstMessage) refreshSessions();

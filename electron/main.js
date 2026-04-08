@@ -234,6 +234,15 @@ ipcMain.on('move-widget', (_e, { x, y }) => {
   if (widgetWindow) widgetWindow.setPosition(Math.round(x), Math.round(y));
 });
 
+// Get widget position (fix drift on Windows)
+ipcMain.handle('get-widget-position', () => {
+  if (widgetWindow) {
+    const [x, y] = widgetWindow.getPosition();
+    return { x, y };
+  }
+  return { x: 0, y: 0 };
+});
+
 // Resize widget window (idle ↔ mini chat)
 ipcMain.on('widget-resize', (_e, { height }) => {
   if (widgetWindow) {
@@ -256,6 +265,14 @@ ipcMain.on('set-widget-interactive', (_e, interactive) => {
 // Settings: get and set
 ipcMain.handle('get-setting', (_e, key) => settings.get(key));
 ipcMain.on('set-setting', (_e, key, value) => settings.set(key, value));
+
+// Widget quick actions (Spotify controls)
+const widgetActions = require('./widgetActions');
+ipcMain.handle('widget:spotify:next', () => widgetActions.spotifyNext());
+ipcMain.handle('widget:spotify:previous', () => widgetActions.spotifyPrevious());
+ipcMain.handle('widget:spotify:toggle', () => widgetActions.spotifyToggle());
+ipcMain.handle('widget:spotify:disable-repeat', () => widgetActions.spotifyDisableRepeat());
+ipcMain.handle('widget:spotify:get-current', () => widgetActions.spotifyGetCurrent());
 
 // ── Sessions ──────────────────────────────────────────────────
 ipcMain.handle('sessions:list', () => sessionOps.list());
@@ -408,14 +425,104 @@ ipcMain.handle('request-permissions', async () => {
   return { granted: true, platform: 'unknown' };
 });
 
+// ── Browser Extension Bridge ──────────────────────────────────
+let lastTabData = null;
+const pendingExtCommands = [];
+const longPollWaiters = []; // resolve functions waiting for next command
+
+function startExtensionBridge() {
+  const http = require('http');
+  const server = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', 'chrome-extension://');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+
+    if (req.url === '/tab' && req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try {
+          lastTabData = JSON.parse(body);
+          if (widgetWindow) widgetWindow.webContents.send('extension-tab', lastTabData);
+        } catch (_) {}
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return;
+    }
+
+    if (req.url.startsWith('/commands') && req.method === 'GET') {
+      const cmds = pendingExtCommands.splice(0);
+      if (cmds.length > 0 || !req.url.includes('wait=1')) {
+        // Return immediately if commands are waiting, or if not long-polling
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(cmds));
+      } else {
+        // Long-poll: hold the response for up to 25s, flush when command arrives
+        const timer = setTimeout(() => {
+          const i = longPollWaiters.findIndex(w => w.res === res);
+          if (i >= 0) longPollWaiters.splice(i, 1);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('[]');
+        }, 25000);
+        longPollWaiters.push({ res, timer });
+        req.on('close', () => {
+          clearTimeout(timer);
+          const i = longPollWaiters.findIndex(w => w.res === res);
+          if (i >= 0) longPollWaiters.splice(i, 1);
+        });
+      }
+      return;
+    }
+
+    // actions.js calls this to queue a command for the extension
+    if (req.url === '/ext-command' && req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        try {
+          pendingExtCommands.push(JSON.parse(body));
+          // Immediately flush to any waiting long-poll connection
+          if (longPollWaiters.length > 0) {
+            const { res: waitRes, timer } = longPollWaiters.shift();
+            clearTimeout(timer);
+            waitRes.writeHead(200, { 'Content-Type': 'application/json' });
+            waitRes.end(JSON.stringify(pendingExtCommands.splice(0)));
+          }
+        } catch (_) {}
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return;
+    }
+
+    res.writeHead(404); res.end();
+  });
+
+  server.on('error', e => console.warn('[BRIDGE] Extension bridge error:', e.message));
+  server.listen(7979, '127.0.0.1', () => console.log('[BRIDGE] Extension bridge on port 7979'));
+}
+
+ipcMain.handle('extension:get-tab', () => lastTabData);
+ipcMain.handle('extension:send-command', (_e, cmd) => {
+  pendingExtCommands.push(cmd);
+  return { ok: true };
+});
+
 app.whenReady().then(() => {
   syncConnectorStates();
   createWindow();
   createWidgetWindow();
   createTray();
+  startExtensionBridge();
 
-  // Start activity monitoring
-  require('./monitors/activityMonitor');
+  // Start activity monitoring after windows are created
+  setTimeout(() => {
+    const { startMonitoring } = require('./monitors/activityMonitor');
+    startMonitoring();
+  }, 2000); // Give windows time to fully initialize
 });
 
 app.on('window-all-closed', (e) => {

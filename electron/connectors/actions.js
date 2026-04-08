@@ -48,6 +48,83 @@ db.exec(`
 `);
 
 // ── Gmail ─────────────────────────────────────────────────────────
+
+const FAKE_DOMAINS = ['@example.com', '@example.org', '@test.com', '@placeholder.com'];
+const FAKE_EMAIL_RE = /[\w.+-]+@(example|test|placeholder)\.(com|org|net)/i;
+
+/** Resolve "myself", "me", first-name-only, etc. to a real email address. */
+async function resolveRecipient(to) {
+  if (!to) throw new Error('No recipient specified');
+
+  // Strip fake domain suffix the AI invents — treat "ronish@example.com" as "ronish"
+  const isFake = FAKE_DOMAINS.some(d => to.trim().toLowerCase().endsWith(d));
+  const stripped = isFake ? to.trim().split('@')[0] : to.trim();
+  const lower = stripped.toLowerCase();
+
+  // "myself" / "me" → logged-in user's email
+  if (lower === 'myself' || lower === 'me') {
+    return await googleAuth.getUserEmail();
+  }
+  // Looks like a real email already
+  if (!isFake && lower.includes('@')) return to;
+  // Try contacts lookup for first-name-only ("alex", "ronish", etc.)
+  try {
+    const contacts = await contactsSearch({ query: to });
+    if (contacts.length > 0 && contacts[0].email) return contacts[0].email;
+  } catch (e) {
+    console.warn('[ACTIONS] contacts lookup failed for', to, e.message);
+  }
+  // Last resort: search Gmail history for emails to/from this person
+  try {
+    const auth = googleAuth.getClient();
+    const gmail = google.gmail({ version: 'v1', auth });
+    const myEmail = await googleAuth.getUserEmail();
+    const list = await gmail.users.messages.list({
+      userId: 'me', q: stripped, maxResults: 10,
+    });
+    const messages = list.data.messages || [];
+    for (const m of messages) {
+      const msg = await gmail.users.messages.get({
+        userId: 'me', id: m.id, format: 'metadata',
+        metadataHeaders: ['From', 'To', 'Cc'],
+      });
+      const headers = Object.fromEntries(
+        (msg.data.payload?.headers || []).map(h => [h.name, h.value])
+      );
+      // Extract all emails from From/To/Cc headers
+      const allAddresses = [headers.From, headers.To, headers.Cc]
+        .filter(Boolean).join(' ');
+      // Find all "Name <email>" or bare email patterns
+      const pairs = [...allAddresses.matchAll(/([^<,;]+?)\s*<([^>]+@[^>]+)>/g)];
+      for (const pair of pairs) {
+        const name = pair[1].trim().toLowerCase();
+        const email = pair[2].trim();
+        if (email === myEmail) continue;
+        if (FAKE_EMAIL_RE.test(email)) continue; // skip fake addresses
+        if (name.includes(lower) || lower.includes(name.split(' ')[0])) {
+          console.log('[ACTIONS] resolved', stripped, '→', email, 'via gmail history');
+          return email;
+        }
+      }
+      // Fallback: any non-self, non-fake email in the thread
+      const bareEmails = allAddresses.match(/[\w.+-]+@[\w-]+\.[\w.]+/g) || [];
+      for (const email of bareEmails) {
+        if (email === myEmail) continue;
+        if (FAKE_EMAIL_RE.test(email)) continue;
+        if (email.toLowerCase().includes(lower.split(' ')[0])) {
+          console.log('[ACTIONS] resolved', stripped, '→', email, 'via gmail bare match');
+          return email;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[ACTIONS] gmail history lookup failed for', to, e.message);
+  }
+
+  // Can't resolve — surface a clear error so the AI can ask for the email
+  throw new Error(`no email address found for "${to}" — ask the user for their email`);
+}
+
 function buildRawEmail({ to, subject, body }) {
   const lines = [
     `To: ${to}`,
@@ -61,17 +138,19 @@ function buildRawEmail({ to, subject, body }) {
 }
 
 async function gmailSend({ to, subject, body }) {
+  const resolvedTo = await resolveRecipient(to);
   const auth = googleAuth.getClient();
   const gmail = google.gmail({ version: 'v1', auth });
-  const raw = buildRawEmail({ to, subject, body });
+  const raw = buildRawEmail({ to: resolvedTo, subject, body });
   const res = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
   return { id: res.data.id, threadId: res.data.threadId };
 }
 
 async function gmailDraft({ to, subject, body }) {
+  const resolvedTo = await resolveRecipient(to);
   const auth = googleAuth.getClient();
   const gmail = google.gmail({ version: 'v1', auth });
-  const raw = buildRawEmail({ to, subject, body });
+  const raw = buildRawEmail({ to: resolvedTo, subject, body });
   const res = await gmail.users.drafts.create({ userId: 'me', requestBody: { message: { raw } } });
   return { id: res.data.id };
 }
@@ -102,13 +181,22 @@ async function gmailSearch({ query, max = 10 }) {
 async function gcalCreate({ summary, start, end, description, attendees }) {
   const auth = googleAuth.getClient();
   const calendar = google.calendar({ version: 'v3', auth });
+
+  // Get the user's calendar timezone; fall back to local system timezone
+  let timeZone;
+  try {
+    const cal = await calendar.calendars.get({ calendarId: 'primary' });
+    timeZone = cal.data.timeZone;
+  } catch (_) {}
+  timeZone = timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
   const res = await calendar.events.insert({
     calendarId: 'primary',
     requestBody: {
       summary,
       description,
-      start: { dateTime: start },
-      end: { dateTime: end },
+      start: { dateTime: start, timeZone },
+      end: { dateTime: end, timeZone },
       attendees: (attendees || []).map(email => ({ email })),
     },
   });
@@ -139,15 +227,36 @@ async function gcalList({ max = 10, timeMin, timeMax }) {
 async function contactsSearch({ query }) {
   const auth = googleAuth.getClient();
   const people = google.people({ version: 'v1', auth });
-  const res = await people.people.searchContacts({
-    query,
-    readMask: 'names,emailAddresses,phoneNumbers',
-  });
-  return (res.data.results || []).map(r => ({
-    name: r.person?.names?.[0]?.displayName,
-    email: r.person?.emailAddresses?.[0]?.value,
-    phone: r.person?.phoneNumbers?.[0]?.value,
-  }));
+
+  // Search personal contacts first
+  let results = [];
+  try {
+    const res = await people.people.searchContacts({
+      query,
+      readMask: 'names,emailAddresses,phoneNumbers',
+    });
+    results = (res.data.results || []).map(r => ({
+      name: r.person?.names?.[0]?.displayName,
+      email: r.person?.emailAddresses?.[0]?.value,
+      phone: r.person?.phoneNumbers?.[0]?.value,
+    })).filter(r => r.email);
+  } catch (_) {}
+
+  // Fall back to "Other Contacts" (auto-created from past emails — Gmail autocomplete uses these)
+  if (results.length === 0) {
+    try {
+      const res = await people.otherContacts.search({
+        query,
+        readMask: 'names,emailAddresses',
+      });
+      results = (res.data.results || []).map(r => ({
+        name: r.person?.names?.[0]?.displayName,
+        email: r.person?.emailAddresses?.[0]?.value,
+      })).filter(r => r.email);
+    } catch (_) {}
+  }
+
+  return results;
 }
 
 // ── Drive ─────────────────────────────────────────────────────────
@@ -187,8 +296,24 @@ async function sheetsRead({ spreadsheetId, range }) {
 }
 
 // ── Spotify ───────────────────────────────────────────────────────
-async function spotifyPlay() { await spotify.api('/me/player/play', { method: 'PUT' }); return { ok: true }; }
+async function spotifyPlay({ query, uri } = {}) {
+  if (query) {
+    const data = await spotify.api('/search', { query: { q: query, type: 'track', limit: 1 } });
+    const track = data?.tracks?.items?.[0];
+    if (!track) throw new Error(`No track found for "${query}"`);
+    await spotify.api('/me/player/play', { method: 'PUT', body: { uris: [track.uri] } });
+    return { track: track.name, artist: track.artists?.map(a => a.name).join(', ') };
+  }
+  if (uri) {
+    await spotify.api('/me/player/play', { method: 'PUT', body: { uris: [uri] } });
+    return { ok: true };
+  }
+  await spotify.api('/me/player/play', { method: 'PUT' });
+  return { ok: true };
+}
 async function spotifyPause() { await spotify.api('/me/player/pause', { method: 'PUT' }); return { ok: true }; }
+async function spotifyNext() { await spotify.api('/me/player/next', { method: 'POST' }); return { ok: true }; }
+async function spotifyPrevious() { await spotify.api('/me/player/previous', { method: 'POST' }); return { ok: true }; }
 async function spotifyQueue({ uri }) {
   await spotify.api('/me/player/queue', { method: 'POST', query: { uri } });
   return { ok: true };
@@ -204,6 +329,55 @@ async function slackSend({ channel, text }) {
 }
 async function slackSearch({ query }) {
   return slack.api('search.messages', { query });
+}
+
+// ── Browser automation ────────────────────────────────────────────
+// Requires the Thera Bridge extension + bridge server running (port 7979)
+async function sendExtensionCommand(cmd) {
+  const http = require('http');
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(cmd);
+    const req = http.request({ hostname: '127.0.0.1', port: 7979, path: '/ext-command', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(JSON.parse(d || '{}'))); }
+    );
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+async function browserOpen({ url, newTab = true }) {
+  await sendExtensionCommand({ type: 'open-url', url, newTab });
+  return { opened: url };
+}
+
+async function browserSearch({ query, engine = 'google' }) {
+  const engines = {
+    google: `https://www.google.com/search?q=${encodeURIComponent(query)}`,
+    youtube: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+    maps: `https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+    amazon: `https://www.amazon.in/s?k=${encodeURIComponent(query)}`,
+    zomato: `https://www.zomato.com/search?q=${encodeURIComponent(query)}`,
+    bookmyshow: `https://in.bookmyshow.com/explore/movies?query=${encodeURIComponent(query)}`,
+  };
+  const url = engines[engine] || engines.google;
+  await sendExtensionCommand({ type: 'open-url', url, newTab: true });
+  return { opened: url };
+}
+
+async function browserWhatsappDm({ to, message }) {
+  await sendExtensionCommand({ type: 'whatsapp-dm', to, message });
+  return { sent: true, to, platform: 'whatsapp' };
+}
+
+async function browserInstagramDm({ to, message }) {
+  await sendExtensionCommand({ type: 'instagram-dm', to, message });
+  return { sent: true, to, platform: 'instagram', note: 'may need you logged in' };
+}
+
+async function browserAutomate({ url, steps, waitAfterNav }) {
+  await sendExtensionCommand({ type: 'automate', url, steps, waitAfterNav, taskId: `task_${Date.now()}` });
+  return { ok: true };
 }
 
 // ── Built-ins ─────────────────────────────────────────────────────
@@ -230,12 +404,19 @@ const HANDLERS = {
   'gsheets.read': sheetsRead,
   'spotify.play': spotifyPlay,
   'spotify.pause': spotifyPause,
+  'spotify.next': spotifyNext,
+  'spotify.previous': spotifyPrevious,
   'spotify.queue': spotifyQueue,
   'spotify.search': spotifySearch,
   'slack.send': slackSend,
   'slack.search': slackSearch,
   'reminders.create': reminderCreate,
   'notes.create': noteCreate,
+  'browser.open': browserOpen,
+  'browser.search': browserSearch,
+  'browser.whatsapp.dm': browserWhatsappDm,
+  'browser.instagram.dm': browserInstagramDm,
+  'browser.automate': browserAutomate,
 };
 
 async function execute({ type, params = {} }) {

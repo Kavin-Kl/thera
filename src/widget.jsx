@@ -2,6 +2,7 @@ import { createRoot } from 'react-dom/client';
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { sendMessageToAI } from './services/aiService';
+import { processAIResponse } from './services/actionExecutor';
 
 const electron = window.require ? window.require('electron') : null;
 const ipcRenderer = electron?.ipcRenderer;
@@ -88,19 +89,58 @@ rules:
 
 shape: honest observation → one real thing or question. done.
 
-respond in 2 sentences max. trust they got it.`;
+respond in 2 sentences max. trust they got it.
+
+---
+
+ACTIONS. you can actually DO stuff on their desktop. when they ask for something you can do, do it — emit an action tag at the very end of your reply, on its own line, like:
+
+<action>{"type":"gmail.draft","params":{"to":"alex","subject":"friday","body":"hey — friday works."}}</action>
+
+available types (exactly these, no others):
+- gmail.draft { to, subject, body }   ← always draft first for emails. never send without explicit go-ahead.
+- gmail.send  { to, subject, body }   ← only after they say send/go/yes on a draft you already showed.
+- gmail.search { query, max? }
+- gcal.create { summary, start, end, description?, attendees? }   ← ISO 8601
+- gcal.list   { max?, timeMin?, timeMax? }
+- gcontacts.search { query }
+- gdrive.search { query, max? }
+- gdocs.create { title, content? }
+- gsheets.read { spreadsheetId, range }
+- spotify.play { query? }  ← plays immediately. if query given, searches and plays that track.
+- spotify.pause {}  /  spotify.next {}  /  spotify.previous {}
+- spotify.queue { uri }  /  spotify.search { query, type? }
+- slack.send { channel, text }   ← draft/confirm pattern applies.
+- slack.search { query }
+- reminders.create { text, when? }
+- notes.create { text }
+- browser.open { url, newTab? }
+- browser.search { query, engine? }   ← engine: google/youtube/maps/amazon/zomato/bookmyshow
+- browser.whatsapp.dm { to, message }
+- browser.instagram.dm { to, message }
+
+rules:
+- your prose reply comes first, then the tag(s), nothing after.
+- never show the raw json or the word "action" in your prose. the tag is invisible infrastructure.
+- if you don't have enough info (no recipient, no time), ask in voice — don't emit a half-filled tag.
+- if the thing isn't in the list, say so briefly. don't fake it.
+- when a result comes back next turn as "[action result] ...", react naturally — "drafted. send?" — don't dump the raw result.`;
 
 function Widget() {
-  const [nudgeText,  setNudgeText]  = useState(null);
-  const [miniChat,   setMiniChat]   = useState(false);
-  const [input,      setInput]      = useState('');
-  const [reply,      setReply]      = useState(null);
-  const [typing,     setTyping]     = useState(false);
-  const [mounted,    setMounted]    = useState(false);
-  const [pressing,   setPressing]   = useState(false);
-  const [pillDims,   setPillDims]   = useState(null);
-  const [nsfwMode,   setNsfwMode]   = useState(false);
-  const [dragging,   setDragging]   = useState(false);
+  const [nudgeText,      setNudgeText]      = useState(null);
+  const [miniChat,       setMiniChat]       = useState(false);
+  const [input,          setInput]          = useState('');
+  const [reply,          setReply]          = useState(null);
+  const [typing,         setTyping]         = useState(false);
+  const [mounted,        setMounted]        = useState(false);
+  const [pressing,       setPressing]       = useState(false);
+  const [pillDims,       setPillDims]       = useState(null);
+  const [nsfwMode,       setNsfwMode]       = useState(false);
+  const [dragging,       setDragging]       = useState(false);
+  const [nowPlaying,     setNowPlaying]     = useState(null); // { track, artist, isPlaying }
+  const [spotifyLoading, setSpotifyLoading] = useState(null); // 'prev'|'toggle'|'next'
+
+  const nowPlayingPollRef = useRef(null);
 
   const dismissTimer   = useRef(null);
   const pressTimer     = useRef(null);
@@ -144,31 +184,53 @@ function Widget() {
     }
   }, []);
 
-  /* ── Window resize when mini chat opens/closes ──────────── */
+  /* ── Spotify now-playing poller ─────────────────────────── */
+  useEffect(() => {
+    let alive = true;
+    async function poll() {
+      try {
+        const res = await ipcRenderer?.invoke('widget:spotify:get-current');
+        if (alive) setNowPlaying(res?.ok && res.isPlaying ? res : null);
+      } catch (_) {
+        if (alive) setNowPlaying(null);
+      }
+    }
+    poll();
+    nowPlayingPollRef.current = setInterval(poll, 5000);
+    return () => { alive = false; clearInterval(nowPlayingPollRef.current); };
+  }, []);
+
+  /* ── Window resize when mini chat or spotify bar changes ── */
   useEffect(() => {
     try {
-      ipcRenderer?.send('widget-resize', { height: miniChat ? 310 : 100 });
+      const base = miniChat ? 310 : 100;
+      const extra = nowPlaying ? 56 : 0;
+      ipcRenderer?.send('widget-resize', { height: base + extra });
       if (miniChat) setTimeout(() => inputRef.current?.focus(), 200);
     } catch (_) {}
-  }, [miniChat]);
+  }, [miniChat, nowPlaying]);
 
   /* ── Drag + click + long-press on the pill ──────────────── */
   const HOLD_MS = 650;
 
-  const handleMouseDown = (e) => {
+  const handleMouseDown = async (e) => {
     if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
 
-    // Get initial window position via IPC to avoid window.screenX drift
-    let initialX = window.screenX;
-    let initialY = window.screenY;
+    // Get actual window position from main process to avoid drift
+    let winPos;
+    try {
+      winPos = await ipcRenderer?.invoke('get-widget-position');
+    } catch (_) {
+      winPos = { x: window.screenX, y: window.screenY };
+    }
 
     dragState.current = {
       startMouseX: e.screenX,
       startMouseY: e.screenY,
-      startWinX:   initialX,
-      startWinY:   initialY,
+      startWinX:   winPos.x,
+      startWinY:   winPos.y,
     };
     isDragging.current     = false;
     pressStartTime.current = Date.now();
@@ -189,18 +251,8 @@ function Widget() {
       }
     }, HOLD_MS);
 
-    let lastMoveTime = 0;
-    const THROTTLE_MS = 16; // ~60fps
-
     const onMove = (moveEvt) => {
       if (!dragState.current) return;
-
-      // Throttle move events for smoothness
-      const now = Date.now();
-      if (now - lastMoveTime < THROTTLE_MS && isDragging.current) {
-        return;
-      }
-      lastMoveTime = now;
 
       const dx = moveEvt.screenX - dragState.current.startMouseX;
       const dy = moveEvt.screenY - dragState.current.startMouseY;
@@ -264,18 +316,41 @@ function Widget() {
     try {
       // Use a trimmed history (last 6 turns) with mini system prompt
       const trimmed = miniHistory.current.slice(-6);
-      const botText = await sendMessageToAI(trimmed, '', MINI_PROMPT);
+      const rawBotText = await sendMessageToAI(trimmed, '', MINI_PROMPT);
+
+      // Strip + execute any <action>...</action> tags the AI emitted.
+      const { displayText, results, resultSummary } = await processAIResponse(rawBotText);
+      const visibleText = results.length > 0
+        ? `${displayText}${displayText ? '\n' : ''}${results.map(r => `— ${r.summary}`).join('\n')}`
+        : displayText;
 
       miniHistory.current = [
         ...miniHistory.current,
-        { role: 'model', parts: [{ text: botText }] },
+        { role: 'model', parts: [{ text: rawBotText }] },
       ];
-      setReply(botText);
+      if (resultSummary) {
+        miniHistory.current.push({
+          role: 'user',
+          parts: [{ text: resultSummary }],
+        });
+      }
+      setReply(visibleText);
     } catch {
       setReply("ugh, something broke. try again?");
     } finally {
       setTyping(false);
     }
+  };
+
+  /* ── Spotify controls ───────────────────────────────────── */
+  const spotifyControl = async (action) => {
+    setSpotifyLoading(action);
+    try {
+      const res = await ipcRenderer?.invoke(`widget:spotify:${action}`);
+      if (res?.track) setNowPlaying({ ...nowPlaying, track: res.track, artist: res.artist, isPlaying: true });
+      if (action === 'toggle') setNowPlaying(p => p ? { ...p, isPlaying: !p.isPlaying } : p);
+    } catch (_) {}
+    setSpotifyLoading(null);
   };
 
   const dismissNudge = (e) => {
@@ -454,6 +529,77 @@ function Widget() {
 
               </AnimatePresence>
             </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── SPOTIFY BAR ──────────────────────────────────── */}
+      <AnimatePresence>
+        {nowPlaying && (
+          <motion.div
+            key="spotify-bar"
+            initial={{ opacity: 0, y: -8, scaleY: 0.9 }}
+            animate={{ opacity: 1, y: 0,  scaleY: 1    }}
+            exit={{   opacity: 0, y: -6,  scaleY: 0.9  }}
+            transition={SOFT_SPRING}
+            onMouseEnter={() => { try { ipcRenderer?.send('set-widget-interactive', true); } catch (_) {} }}
+            onMouseLeave={() => { if (!miniChat) { try { ipcRenderer?.send('set-widget-interactive', false); } catch (_) {} } }}
+            style={{
+              pointerEvents: 'auto',
+              marginTop: 5,
+              width: 260,
+              background: 'rgba(16,14,12,0.94)',
+              backdropFilter: 'blur(40px) saturate(180%)',
+              WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+              border: '0.5px solid rgba(255,255,255,0.07)',
+              borderRadius: 14,
+              boxShadow: '0 4px 20px rgba(0,0,0,0.45)',
+              display: 'flex', alignItems: 'center',
+              gap: 8, padding: '8px 12px',
+              transformOrigin: 'top center',
+            }}
+          >
+            {/* Spotify dot */}
+            <motion.div
+              animate={{ opacity: nowPlaying.isPlaying ? [0.5,1,0.5] : 0.3 }}
+              transition={{ duration: 1.8, repeat: nowPlaying.isPlaying ? Infinity : 0 }}
+              style={{ width: 5, height: 5, borderRadius: '50%', background: '#1DB954', flexShrink: 0 }}
+            />
+
+            {/* Track info */}
+            <div style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
+              <div style={{
+                fontFamily: BRIC, fontSize: 11, fontWeight: 500,
+                color: 'rgba(255,255,255,0.85)',
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>{nowPlaying.track}</div>
+              <div style={{
+                fontFamily: MONO, fontSize: 8.5,
+                color: 'rgba(255,255,255,0.32)',
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>{nowPlaying.artist}</div>
+            </div>
+
+            {/* Controls */}
+            {['previous', 'toggle', 'next'].map(action => (
+              <motion.button
+                key={action}
+                onMouseDown={e => e.stopPropagation()}
+                onClick={() => spotifyControl(action)}
+                whileHover={{ scale: 1.2 }} whileTap={{ scale: 0.85 }}
+                disabled={spotifyLoading === action}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: spotifyLoading === action ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.55)',
+                  padding: '2px 3px', fontSize: 10, lineHeight: 1, flexShrink: 0,
+                  transition: 'color 0.15s',
+                }}
+                onMouseEnter={e => { if (spotifyLoading !== action) e.currentTarget.style.color = '#fff'; }}
+                onMouseLeave={e => e.currentTarget.style.color = spotifyLoading === action ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.55)'}
+              >
+                {action === 'previous' ? '⏮' : action === 'toggle' ? (nowPlaying.isPlaying ? '⏸' : '▶') : '⏭'}
+              </motion.button>
+            ))}
           </motion.div>
         )}
       </AnimatePresence>

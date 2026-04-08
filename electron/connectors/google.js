@@ -15,6 +15,7 @@ const SCOPES = [
   'https://www.googleapis.com/auth/gmail.compose',
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/contacts.readonly',
+  'https://www.googleapis.com/auth/contacts.other.readonly',
   'https://www.googleapis.com/auth/drive.readonly',
   'https://www.googleapis.com/auth/documents',
   'https://www.googleapis.com/auth/spreadsheets',
@@ -79,4 +80,22 @@ function getClient() {
   return client;
 }
 
-module.exports = { connect, disconnect, isConnected, getClient, hasCredentials };
+/** Returns the authenticated user's email address. Cached after first call. */
+let _cachedEmail = null;
+async function getUserEmail() {
+  if (_cachedEmail) return _cachedEmail;
+  const auth = getClient();
+  const oauth2 = google.oauth2({ version: 'v2', auth });
+  const res = await oauth2.userinfo.get();
+  _cachedEmail = res.data.email;
+  return _cachedEmail;
+}
+
+// Clear cache on disconnect
+const _origDisconnect = disconnect;
+function disconnectAndClear() {
+  _cachedEmail = null;
+  _origDisconnect();
+}
+
+module.exports = { connect, disconnect: disconnectAndClear, isConnected, getClient, hasCredentials, getUserEmail };

@@ -23,7 +23,17 @@ export async function fetchMemoryContext(userId, query) {
       console.log('[MEMORY] No memories found for this user yet');
       return '';
     }
-    const context = memories.map((m) => m.memory).join('\n');
+    // Strip memories about failed actions — they cause the AI to refuse to retry
+    const STALE_PATTERNS = [
+      /no email.*(found|provided|given)/i,
+      /hasn't (provided|given|shared).*(email|address)/i,
+      /email address.*not (found|provided|available)/i,
+      /failed to (send|draft|find)/i,
+    ];
+    const filtered = memories.filter(m =>
+      !STALE_PATTERNS.some(re => re.test(m.memory))
+    );
+    const context = filtered.map((m) => m.memory).join('\n');
     console.log('[MEMORY] Found context:', context.slice(0, 100) + '...');
     return context;
   } catch (e) {

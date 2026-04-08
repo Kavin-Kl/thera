@@ -64,7 +64,7 @@ function startLoopback({ path = '/oauth/callback', timeoutMs = 5 * 60 * 1000 } =
  * Higher-level helper: starts the loopback, calls `buildAuthUrl(port)` to get
  * the URL to open in the browser, opens it, and returns the OAuth callback query.
  */
-async function runOAuthFlow({ buildAuthUrl, callbackPath = '/oauth/callback' }) {
+async function runOAuthFlow({ buildAuthUrl, callbackPath = '/oauth/callback', fixedPort = 0 }) {
   const { shell } = require('electron');
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
@@ -96,7 +96,17 @@ async function runOAuthFlow({ buildAuthUrl, callbackPath = '/oauth/callback' }) 
       reject(new Error('OAuth timed out after 5 min'));
     }, 5 * 60 * 1000);
 
-    server.listen(0, '127.0.0.1', async () => {
+    // fixedPort: 0 = random (Google works with any port), non-zero = fixed (Spotify needs exact match)
+    server.on('error', (err) => {
+      clearTimeout(timer);
+      if (err.code === 'EADDRINUSE') {
+        reject(new Error(`Port ${fixedPort} is already in use. Close the app using it and try again.`));
+      } else {
+        reject(err);
+      }
+    });
+
+    server.listen(fixedPort, '127.0.0.1', async () => {
       const { port } = server.address();
       try {
         const authUrl = await buildAuthUrl(port);

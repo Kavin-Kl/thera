@@ -407,7 +407,7 @@ var require_oauthLoopback = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 	* Higher-level helper: starts the loopback, calls `buildAuthUrl(port)` to get
 	* the URL to open in the browser, opens it, and returns the OAuth callback query.
 	*/
-	async function runOAuthFlow({ buildAuthUrl, callbackPath = "/oauth/callback" }) {
+	async function runOAuthFlow({ buildAuthUrl, callbackPath = "/oauth/callback", fixedPort = 0 }) {
 		const { shell } = require("electron");
 		return new Promise((resolve, reject) => {
 			const server = http.createServer((req, res) => {
@@ -441,7 +441,12 @@ var require_oauthLoopback = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 				server.close();
 				reject(/* @__PURE__ */ new Error("OAuth timed out after 5 min"));
 			}, 300 * 1e3);
-			server.listen(0, "127.0.0.1", async () => {
+			server.on("error", (err) => {
+				clearTimeout(timer);
+				if (err.code === "EADDRINUSE") reject(/* @__PURE__ */ new Error(`Port ${fixedPort} is already in use. Close the app using it and try again.`));
+				else reject(err);
+			});
+			server.listen(fixedPort, "127.0.0.1", async () => {
 				const { port } = server.address();
 				try {
 					const authUrl = await buildAuthUrl(port);
@@ -466,7 +471,7 @@ var require_google = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	* Tokens are persisted via tokenStore. The exported `getClient()` returns an
 	* authorized OAuth2 client ready to pass into googleapis services.
 	*/
-	var { google: google$1 } = require("googleapis");
+	var { google: google$2 } = require("googleapis");
 	var tokenStore = require_tokenStore();
 	var { runOAuthFlow } = require_oauthLoopback();
 	var SCOPES = [
@@ -475,6 +480,7 @@ var require_google = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		"https://www.googleapis.com/auth/gmail.compose",
 		"https://www.googleapis.com/auth/calendar",
 		"https://www.googleapis.com/auth/contacts.readonly",
+		"https://www.googleapis.com/auth/contacts.other.readonly",
 		"https://www.googleapis.com/auth/drive.readonly",
 		"https://www.googleapis.com/auth/documents",
 		"https://www.googleapis.com/auth/spreadsheets",
@@ -484,7 +490,7 @@ var require_google = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		return !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_CLIENT_ID !== "your_google_oauth_client_id");
 	}
 	function makeClient(redirectUri) {
-		return new google$1.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, redirectUri);
+		return new google$2.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, redirectUri);
 	}
 	async function connect() {
 		if (!hasCredentials()) throw new Error("Google OAuth not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to .env");
@@ -522,12 +528,29 @@ var require_google = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		});
 		return client;
 	}
+	/** Returns the authenticated user's email address. Cached after first call. */
+	var _cachedEmail = null;
+	async function getUserEmail() {
+		if (_cachedEmail) return _cachedEmail;
+		const auth = getClient();
+		_cachedEmail = (await google$2.oauth2({
+			version: "v2",
+			auth
+		}).userinfo.get()).data.email;
+		return _cachedEmail;
+	}
+	var _origDisconnect = disconnect;
+	function disconnectAndClear() {
+		_cachedEmail = null;
+		_origDisconnect();
+	}
 	module.exports = {
 		connect,
-		disconnect,
+		disconnect: disconnectAndClear,
 		isConnected,
 		getClient,
-		hasCredentials
+		hasCredentials,
+		getUserEmail
 	};
 }));
 //#endregion
@@ -552,20 +575,22 @@ var require_spotify = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function connect() {
 		if (!hasCredentials()) throw new Error("Spotify OAuth not configured. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to .env");
-		let capturedRedirect = null;
-		const query = await runOAuthFlow({ buildAuthUrl: (port) => {
-			capturedRedirect = `http://127.0.0.1:${port}/oauth/callback`;
-			return `https://accounts.spotify.com/authorize?${new URLSearchParams({
-				response_type: "code",
-				client_id: process.env.SPOTIFY_CLIENT_ID,
-				scope: SCOPES,
-				redirect_uri: capturedRedirect
-			})}`;
-		} });
+		const REDIRECT_URI = "http://127.0.0.1:51234/oauth/callback";
+		const query = await runOAuthFlow({
+			fixedPort: 51234,
+			buildAuthUrl: () => {
+				return `https://accounts.spotify.com/authorize?${new URLSearchParams({
+					response_type: "code",
+					client_id: process.env.SPOTIFY_CLIENT_ID,
+					scope: SCOPES,
+					redirect_uri: REDIRECT_URI
+				})}`;
+			}
+		});
 		const body = new URLSearchParams({
 			grant_type: "authorization_code",
 			code: query.code,
-			redirect_uri: capturedRedirect
+			redirect_uri: REDIRECT_URI
 		});
 		const auth = Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString("base64");
 		const res = await fetch("https://accounts.spotify.com/api/token", {
@@ -749,7 +774,7 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	*   reminders.create   { text, when? }   (built-in, written to local DB)
 	*   notes.create       { text }          (built-in, written to local DB)
 	*/
-	var { google } = require("googleapis");
+	var { google: google$1 } = require("googleapis");
 	var googleAuth = require_google();
 	var spotify = require_spotify();
 	var slack = require_slack();
@@ -768,6 +793,82 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
     created_at INTEGER DEFAULT (strftime('%s','now'))
   );
 `);
+	var FAKE_DOMAINS = [
+		"@example.com",
+		"@example.org",
+		"@test.com",
+		"@placeholder.com"
+	];
+	var FAKE_EMAIL_RE = /[\w.+-]+@(example|test|placeholder)\.(com|org|net)/i;
+	/** Resolve "myself", "me", first-name-only, etc. to a real email address. */
+	async function resolveRecipient(to) {
+		if (!to) throw new Error("No recipient specified");
+		const isFake = FAKE_DOMAINS.some((d) => to.trim().toLowerCase().endsWith(d));
+		const stripped = isFake ? to.trim().split("@")[0] : to.trim();
+		const lower = stripped.toLowerCase();
+		if (lower === "myself" || lower === "me") return await googleAuth.getUserEmail();
+		if (!isFake && lower.includes("@")) return to;
+		try {
+			const contacts = await contactsSearch({ query: to });
+			if (contacts.length > 0 && contacts[0].email) return contacts[0].email;
+		} catch (e) {
+			console.warn("[ACTIONS] contacts lookup failed for", to, e.message);
+		}
+		try {
+			const auth = googleAuth.getClient();
+			const gmail = google$1.gmail({
+				version: "v1",
+				auth
+			});
+			const myEmail = await googleAuth.getUserEmail();
+			const messages = (await gmail.users.messages.list({
+				userId: "me",
+				q: stripped,
+				maxResults: 10
+			})).data.messages || [];
+			for (const m of messages) {
+				const msg = await gmail.users.messages.get({
+					userId: "me",
+					id: m.id,
+					format: "metadata",
+					metadataHeaders: [
+						"From",
+						"To",
+						"Cc"
+					]
+				});
+				const headers = Object.fromEntries((msg.data.payload?.headers || []).map((h) => [h.name, h.value]));
+				const allAddresses = [
+					headers.From,
+					headers.To,
+					headers.Cc
+				].filter(Boolean).join(" ");
+				const pairs = [...allAddresses.matchAll(/([^<,;]+?)\s*<([^>]+@[^>]+)>/g)];
+				for (const pair of pairs) {
+					const name = pair[1].trim().toLowerCase();
+					const email = pair[2].trim();
+					if (email === myEmail) continue;
+					if (FAKE_EMAIL_RE.test(email)) continue;
+					if (name.includes(lower) || lower.includes(name.split(" ")[0])) {
+						console.log("[ACTIONS] resolved", stripped, "→", email, "via gmail history");
+						return email;
+					}
+				}
+				const bareEmails = allAddresses.match(/[\w.+-]+@[\w-]+\.[\w.]+/g) || [];
+				for (const email of bareEmails) {
+					if (email === myEmail) continue;
+					if (FAKE_EMAIL_RE.test(email)) continue;
+					if (email.toLowerCase().includes(lower.split(" ")[0])) {
+						console.log("[ACTIONS] resolved", stripped, "→", email, "via gmail bare match");
+						return email;
+					}
+				}
+			}
+		} catch (e) {
+			console.warn("[ACTIONS] gmail history lookup failed for", to, e.message);
+		}
+		throw new Error(`no email address found for "${to}" — ask the user for their email`);
+	}
 	function buildRawEmail({ to, subject, body }) {
 		const lines = [
 			`To: ${to}`,
@@ -779,13 +880,14 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		return Buffer.from(lines.join("\r\n")).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 	}
 	async function gmailSend({ to, subject, body }) {
+		const resolvedTo = await resolveRecipient(to);
 		const auth = googleAuth.getClient();
-		const gmail = google.gmail({
+		const gmail = google$1.gmail({
 			version: "v1",
 			auth
 		});
 		const raw = buildRawEmail({
-			to,
+			to: resolvedTo,
 			subject,
 			body
 		});
@@ -799,13 +901,14 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		};
 	}
 	async function gmailDraft({ to, subject, body }) {
+		const resolvedTo = await resolveRecipient(to);
 		const auth = googleAuth.getClient();
-		const gmail = google.gmail({
+		const gmail = google$1.gmail({
 			version: "v1",
 			auth
 		});
 		const raw = buildRawEmail({
-			to,
+			to: resolvedTo,
 			subject,
 			body
 		});
@@ -816,7 +919,7 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function gmailSearch({ query, max = 10 }) {
 		const auth = googleAuth.getClient();
-		const gmail = google.gmail({
+		const gmail = google$1.gmail({
 			version: "v1",
 			auth
 		});
@@ -847,16 +950,28 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function gcalCreate({ summary, start, end, description, attendees }) {
 		const auth = googleAuth.getClient();
-		const res = await google.calendar({
+		const calendar = google$1.calendar({
 			version: "v3",
 			auth
-		}).events.insert({
+		});
+		let timeZone;
+		try {
+			timeZone = (await calendar.calendars.get({ calendarId: "primary" })).data.timeZone;
+		} catch (_) {}
+		timeZone = timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+		const res = await calendar.events.insert({
 			calendarId: "primary",
 			requestBody: {
 				summary,
 				description,
-				start: { dateTime: start },
-				end: { dateTime: end },
+				start: {
+					dateTime: start,
+					timeZone
+				},
+				end: {
+					dateTime: end,
+					timeZone
+				},
 				attendees: (attendees || []).map((email) => ({ email }))
 			}
 		});
@@ -867,7 +982,7 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function gcalList({ max = 10, timeMin, timeMax }) {
 		const auth = googleAuth.getClient();
-		return ((await google.calendar({
+		return ((await google$1.calendar({
 			version: "v3",
 			auth
 		}).events.list({
@@ -887,21 +1002,35 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function contactsSearch({ query }) {
 		const auth = googleAuth.getClient();
-		return ((await google.people({
+		const people = google$1.people({
 			version: "v1",
 			auth
-		}).people.searchContacts({
-			query,
-			readMask: "names,emailAddresses,phoneNumbers"
-		})).data.results || []).map((r) => ({
-			name: r.person?.names?.[0]?.displayName,
-			email: r.person?.emailAddresses?.[0]?.value,
-			phone: r.person?.phoneNumbers?.[0]?.value
-		}));
+		});
+		let results = [];
+		try {
+			results = ((await people.people.searchContacts({
+				query,
+				readMask: "names,emailAddresses,phoneNumbers"
+			})).data.results || []).map((r) => ({
+				name: r.person?.names?.[0]?.displayName,
+				email: r.person?.emailAddresses?.[0]?.value,
+				phone: r.person?.phoneNumbers?.[0]?.value
+			})).filter((r) => r.email);
+		} catch (_) {}
+		if (results.length === 0) try {
+			results = ((await people.otherContacts.search({
+				query,
+				readMask: "names,emailAddresses"
+			})).data.results || []).map((r) => ({
+				name: r.person?.names?.[0]?.displayName,
+				email: r.person?.emailAddresses?.[0]?.value
+			})).filter((r) => r.email);
+		} catch (_) {}
+		return results;
 	}
 	async function driveSearch({ query, max = 10 }) {
 		const auth = googleAuth.getClient();
-		return (await google.drive({
+		return (await google$1.drive({
 			version: "v3",
 			auth
 		}).files.list({
@@ -912,7 +1041,7 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function docsCreate({ title, content }) {
 		const auth = googleAuth.getClient();
-		const docs = google.docs({
+		const docs = google$1.docs({
 			version: "v1",
 			auth
 		});
@@ -931,7 +1060,7 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	}
 	async function sheetsRead({ spreadsheetId, range }) {
 		const auth = googleAuth.getClient();
-		return (await google.sheets({
+		return (await google$1.sheets({
 			version: "v4",
 			auth
 		}).spreadsheets.values.get({
@@ -939,12 +1068,43 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			range
 		})).data.values || [];
 	}
-	async function spotifyPlay() {
+	async function spotifyPlay({ query, uri } = {}) {
+		if (query) {
+			const track = (await spotify.api("/search", { query: {
+				q: query,
+				type: "track",
+				limit: 1
+			} }))?.tracks?.items?.[0];
+			if (!track) throw new Error(`No track found for "${query}"`);
+			await spotify.api("/me/player/play", {
+				method: "PUT",
+				body: { uris: [track.uri] }
+			});
+			return {
+				track: track.name,
+				artist: track.artists?.map((a) => a.name).join(", ")
+			};
+		}
+		if (uri) {
+			await spotify.api("/me/player/play", {
+				method: "PUT",
+				body: { uris: [uri] }
+			});
+			return { ok: true };
+		}
 		await spotify.api("/me/player/play", { method: "PUT" });
 		return { ok: true };
 	}
 	async function spotifyPause() {
 		await spotify.api("/me/player/pause", { method: "PUT" });
+		return { ok: true };
+	}
+	async function spotifyNext() {
+		await spotify.api("/me/player/next", { method: "POST" });
+		return { ok: true };
+	}
+	async function spotifyPrevious() {
+		await spotify.api("/me/player/previous", { method: "POST" });
 		return { ok: true };
 	}
 	async function spotifyQueue({ uri }) {
@@ -970,6 +1130,89 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	async function slackSearch({ query }) {
 		return slack.api("search.messages", { query });
 	}
+	async function sendExtensionCommand(cmd) {
+		const http = require("http");
+		return new Promise((resolve, reject) => {
+			const body = JSON.stringify(cmd);
+			const req = http.request({
+				hostname: "127.0.0.1",
+				port: 7979,
+				path: "/ext-command",
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(body)
+				}
+			}, (res) => {
+				let d = "";
+				res.on("data", (c) => d += c);
+				res.on("end", () => resolve(JSON.parse(d || "{}")));
+			});
+			req.on("error", reject);
+			req.write(body);
+			req.end();
+		});
+	}
+	async function browserOpen({ url, newTab = true }) {
+		await sendExtensionCommand({
+			type: "open-url",
+			url,
+			newTab
+		});
+		return { opened: url };
+	}
+	async function browserSearch({ query, engine = "google" }) {
+		const engines = {
+			google: `https://www.google.com/search?q=${encodeURIComponent(query)}`,
+			youtube: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+			maps: `https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+			amazon: `https://www.amazon.in/s?k=${encodeURIComponent(query)}`,
+			zomato: `https://www.zomato.com/search?q=${encodeURIComponent(query)}`,
+			bookmyshow: `https://in.bookmyshow.com/explore/movies?query=${encodeURIComponent(query)}`
+		};
+		const url = engines[engine] || engines.google;
+		await sendExtensionCommand({
+			type: "open-url",
+			url,
+			newTab: true
+		});
+		return { opened: url };
+	}
+	async function browserWhatsappDm({ to, message }) {
+		await sendExtensionCommand({
+			type: "whatsapp-dm",
+			to,
+			message
+		});
+		return {
+			sent: true,
+			to,
+			platform: "whatsapp"
+		};
+	}
+	async function browserInstagramDm({ to, message }) {
+		await sendExtensionCommand({
+			type: "instagram-dm",
+			to,
+			message
+		});
+		return {
+			sent: true,
+			to,
+			platform: "instagram",
+			note: "may need you logged in"
+		};
+	}
+	async function browserAutomate({ url, steps, waitAfterNav }) {
+		await sendExtensionCommand({
+			type: "automate",
+			url,
+			steps,
+			waitAfterNav,
+			taskId: `task_${Date.now()}`
+		});
+		return { ok: true };
+	}
 	function reminderCreate({ text, when }) {
 		const dueAt = when ? Math.floor(new Date(when).getTime() / 1e3) : null;
 		return { id: db.prepare(`INSERT INTO reminders (text, due_at) VALUES (?, ?)`).run(text, dueAt).lastInsertRowid };
@@ -989,12 +1232,19 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		"gsheets.read": sheetsRead,
 		"spotify.play": spotifyPlay,
 		"spotify.pause": spotifyPause,
+		"spotify.next": spotifyNext,
+		"spotify.previous": spotifyPrevious,
 		"spotify.queue": spotifyQueue,
 		"spotify.search": spotifySearch,
 		"slack.send": slackSend,
 		"slack.search": slackSearch,
 		"reminders.create": reminderCreate,
-		"notes.create": noteCreate
+		"notes.create": noteCreate,
+		"browser.open": browserOpen,
+		"browser.search": browserSearch,
+		"browser.whatsapp.dm": browserWhatsappDm,
+		"browser.instagram.dm": browserInstagramDm,
+		"browser.automate": browserAutomate
 	};
 	async function execute({ type, params = {} }) {
 		const handler = HANDLERS[type];
@@ -1018,6 +1268,395 @@ var require_actions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	};
 }));
 //#endregion
+//#region electron/widgetActions.js
+var require_widgetActions = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	/**
+	* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	* WIDGET QUICK ACTIONS
+	* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	*
+	* Actions that can be triggered from the widget (nudges + mini chat)
+	* - Change Spotify song
+	* - Pause/resume music
+	* - Snooze reminders
+	* - Quick replies
+	*
+	* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	*/
+	var spotify = require_spotify();
+	/**
+	* Skip to next track
+	*/
+	async function spotifyNext() {
+		try {
+			if (!spotify.isConnected()) return {
+				ok: false,
+				error: "Spotify not connected"
+			};
+			await spotify.api("/me/player/next", { method: "POST" });
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			const player = await spotify.api("/me/player");
+			if (player?.item) return {
+				ok: true,
+				track: player.item.name,
+				artist: player.item.artists?.map((a) => a.name).join(", ") || "Unknown"
+			};
+			return { ok: true };
+		} catch (e) {
+			console.error("[WIDGET:SPOTIFY] Skip failed:", e.message);
+			return {
+				ok: false,
+				error: e.message
+			};
+		}
+	}
+	/**
+	* Go to previous track
+	*/
+	async function spotifyPrevious() {
+		try {
+			if (!spotify.isConnected()) return {
+				ok: false,
+				error: "Spotify not connected"
+			};
+			await spotify.api("/me/player/previous", { method: "POST" });
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			const player = await spotify.api("/me/player");
+			if (player?.item) return {
+				ok: true,
+				track: player.item.name,
+				artist: player.item.artists?.map((a) => a.name).join(", ") || "Unknown"
+			};
+			return { ok: true };
+		} catch (e) {
+			console.error("[WIDGET:SPOTIFY] Previous failed:", e.message);
+			return {
+				ok: false,
+				error: e.message
+			};
+		}
+	}
+	/**
+	* Toggle play/pause
+	*/
+	async function spotifyToggle() {
+		try {
+			if (!spotify.isConnected()) return {
+				ok: false,
+				error: "Spotify not connected"
+			};
+			if ((await spotify.api("/me/player"))?.is_playing) {
+				await spotify.api("/me/player/pause", { method: "PUT" });
+				return {
+					ok: true,
+					action: "paused"
+				};
+			} else {
+				await spotify.api("/me/player/play", { method: "PUT" });
+				return {
+					ok: true,
+					action: "playing"
+				};
+			}
+		} catch (e) {
+			console.error("[WIDGET:SPOTIFY] Toggle failed:", e.message);
+			return {
+				ok: false,
+				error: e.message
+			};
+		}
+	}
+	/**
+	* Turn off repeat (when user is looping)
+	*/
+	async function spotifyDisableRepeat() {
+		try {
+			if (!spotify.isConnected()) return {
+				ok: false,
+				error: "Spotify not connected"
+			};
+			await spotify.api("/me/player/repeat?state=off", { method: "PUT" });
+			return { ok: true };
+		} catch (e) {
+			console.error("[WIDGET:SPOTIFY] Disable repeat failed:", e.message);
+			return {
+				ok: false,
+				error: e.message
+			};
+		}
+	}
+	/**
+	* Get current playback state
+	*/
+	async function spotifyGetCurrent() {
+		try {
+			if (!spotify.isConnected()) return {
+				ok: false,
+				error: "Spotify not connected"
+			};
+			const player = await spotify.api("/me/player");
+			if (!player?.item) return {
+				ok: true,
+				isPlaying: false,
+				track: null
+			};
+			return {
+				ok: true,
+				isPlaying: player.is_playing,
+				track: player.item.name,
+				artist: player.item.artists?.map((a) => a.name).join(", ") || "Unknown",
+				album: player.item.album?.name || "Unknown",
+				repeat: player.repeat_state,
+				position_ms: player.progress_ms,
+				duration_ms: player.item.duration_ms
+			};
+		} catch (e) {
+			console.error("[WIDGET:SPOTIFY] Get current failed:", e.message);
+			return {
+				ok: false,
+				error: e.message
+			};
+		}
+	}
+	module.exports = {
+		spotifyNext,
+		spotifyPrevious,
+		spotifyToggle,
+		spotifyDisableRepeat,
+		spotifyGetCurrent
+	};
+}));
+//#endregion
+//#region electron/monitors/contextEnricher.js
+var require_contextEnricher = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	/**
+	* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	* INTELLIGENT CONTEXT ENRICHER
+	* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	*
+	* Fetches real-time context from connected services to understand EXACTLY
+	* what the user is doing right now.
+	*
+	* Examples:
+	* - Spotify: current song, artist, album, play count
+	* - Gmail: drafting to who, subject line preview
+	* - Calendar: current meeting, attendees
+	* - YouTube: video title, channel, watch time
+	* - Code editor: file name, language, recent commits
+	*
+	* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	*/
+	var spotify = require_spotify();
+	var googleAuth = require_google();
+	var { google } = require("googleapis");
+	var lastSpotifyCheck = 0;
+	var cachedSpotifyContext = null;
+	var SPOTIFY_CACHE_MS = 1e4;
+	/**
+	* Get current Spotify playback state + track info
+	* Returns: { track, artist, album, isPlaying, position_ms, duration_ms, repeat_state }
+	*/
+	async function getSpotifyContext() {
+		try {
+			if (!spotify.isConnected()) return null;
+			const now = Date.now();
+			if (cachedSpotifyContext && now - lastSpotifyCheck < SPOTIFY_CACHE_MS) return cachedSpotifyContext;
+			const data = await spotify.api("/me/player");
+			if (!data || !data.item) {
+				cachedSpotifyContext = null;
+				lastSpotifyCheck = now;
+				return null;
+			}
+			const context = {
+				track: data.item.name,
+				artist: data.item.artists?.map((a) => a.name).join(", ") || "Unknown Artist",
+				album: data.item.album?.name || "Unknown Album",
+				isPlaying: data.is_playing,
+				position_ms: data.progress_ms || 0,
+				duration_ms: data.item.duration_ms || 0,
+				repeat_state: data.repeat_state,
+				uri: data.item.uri,
+				popularity: data.item.popularity || 0
+			};
+			cachedSpotifyContext = context;
+			lastSpotifyCheck = now;
+			console.log("[CONTEXT:SPOTIFY]", context.isPlaying ? "▶" : "⏸", `"${context.track}" by ${context.artist}`);
+			return context;
+		} catch (e) {
+			console.error("[CONTEXT:SPOTIFY] Failed:", e.message);
+			return null;
+		}
+	}
+	/**
+	* Detect if user is looping a song (repeat_state = 'track')
+	*/
+	function isLoopingTrack(spotifyContext) {
+		return spotifyContext?.repeat_state === "track";
+	}
+	/**
+	* Detect if user has been listening to same song for a long time
+	* (even without explicit repeat — might be manually replaying)
+	*/
+	var lastTrackUri = null;
+	var trackPlayCount = 0;
+	var firstPlayStart = 0;
+	function detectSongLoop(spotifyContext) {
+		if (!spotifyContext) return null;
+		const currentUri = spotifyContext.uri;
+		if (currentUri !== lastTrackUri) {
+			lastTrackUri = currentUri;
+			trackPlayCount = 1;
+			firstPlayStart = Date.now();
+			return null;
+		}
+		trackPlayCount++;
+		const totalListenTime = Date.now() - firstPlayStart;
+		totalListenTime / trackPlayCount;
+		if (totalListenTime > 600 * 1e3 || trackPlayCount >= 3) return {
+			track: spotifyContext.track,
+			artist: spotifyContext.artist,
+			playCount: trackPlayCount,
+			totalMinutes: Math.floor(totalListenTime / 6e4),
+			isRepeating: spotifyContext.repeat_state === "track"
+		};
+		return null;
+	}
+	/**
+	* Get current Gmail draft (if composing)
+	* Returns: { to, subject, snippet }
+	*/
+	async function getGmailDraftContext() {
+		try {
+			if (!googleAuth.isConnected()) return null;
+			const auth = googleAuth.getClient();
+			const gmail = google.gmail({
+				version: "v1",
+				auth
+			});
+			const list = await gmail.users.drafts.list({
+				userId: "me",
+				maxResults: 1
+			});
+			if (!list.data.drafts || list.data.drafts.length === 0) return null;
+			const draft = await gmail.users.drafts.get({
+				userId: "me",
+				id: list.data.drafts[0].id,
+				format: "metadata",
+				metadataHeaders: ["To", "Subject"]
+			});
+			const headers = Object.fromEntries((draft.data.message?.payload?.headers || []).map((h) => [h.name, h.value]));
+			return {
+				to: headers.To || "unknown",
+				subject: headers.Subject || "(no subject)",
+				snippet: draft.data.message?.snippet || ""
+			};
+		} catch (e) {
+			console.error("[CONTEXT:GMAIL] Failed:", e.message);
+			return null;
+		}
+	}
+	/**
+	* Get current/upcoming calendar event
+	* Returns: { summary, start, end, attendees, minutesUntil }
+	*/
+	async function getCalendarContext() {
+		try {
+			if (!googleAuth.isConnected()) return null;
+			const auth = googleAuth.getClient();
+			const calendar = google.calendar({
+				version: "v3",
+				auth
+			});
+			const now = /* @__PURE__ */ new Date();
+			const soon = new Date(now.getTime() + 3600 * 1e3);
+			const res = await calendar.events.list({
+				calendarId: "primary",
+				timeMin: now.toISOString(),
+				timeMax: soon.toISOString(),
+				maxResults: 1,
+				singleEvents: true,
+				orderBy: "startTime"
+			});
+			if (!res.data.items || res.data.items.length === 0) return null;
+			const event = res.data.items[0];
+			const startTime = new Date(event.start?.dateTime || event.start?.date);
+			const minutesUntil = Math.floor((startTime - now) / 6e4);
+			return {
+				summary: event.summary,
+				start: event.start?.dateTime || event.start?.date,
+				end: event.end?.dateTime || event.end?.date,
+				attendees: event.attendees?.map((a) => a.email) || [],
+				minutesUntil,
+				isNow: minutesUntil <= 5
+			};
+		} catch (e) {
+			console.error("[CONTEXT:CALENDAR] Failed:", e.message);
+			return null;
+		}
+	}
+	/**
+	* Enrich activity with real-time context from connected services
+	* Only fetch context relevant to current activity type
+	*/
+	async function enrichContext(activity, windowTitle) {
+		const enriched = { ...activity };
+		try {
+			const spotifyContext = await getSpotifyContext();
+			if (spotifyContext && spotifyContext.isPlaying) {
+				enriched.spotify = spotifyContext;
+				const loopInfo = detectSongLoop(spotifyContext);
+				if (loopInfo) enriched.spotifyLoop = loopInfo;
+			}
+			if (activity.type === "email-composing") {
+				const gmailContext = await getGmailDraftContext();
+				if (gmailContext) enriched.gmail = gmailContext;
+			}
+			const calendarContext = await getCalendarContext();
+			if (calendarContext) enriched.calendar = calendarContext;
+			return enriched;
+		} catch (e) {
+			console.error("[CONTEXT:ENRICH] Error:", e.message);
+			return enriched;
+		}
+	}
+	/**
+	* Build a natural language summary for the AI prompt
+	*/
+	function buildContextSummary(enrichedActivity) {
+		const parts = [];
+		parts.push(`activity: ${enrichedActivity.detail}`);
+		if (enrichedActivity.spotify) {
+			const sp = enrichedActivity.spotify;
+			const status = sp.isPlaying ? "playing" : "paused";
+			parts.push(`spotify ${status}: "${sp.track}" by ${sp.artist}`);
+			if (enrichedActivity.spotifyLoop) {
+				const loop = enrichedActivity.spotifyLoop;
+				if (loop.isRepeating) parts.push(`(on repeat for ${loop.totalMinutes} min)`);
+				else parts.push(`(listened ${loop.playCount} times in ${loop.totalMinutes} min)`);
+			}
+		}
+		if (enrichedActivity.gmail) {
+			const gm = enrichedActivity.gmail;
+			parts.push(`drafting email to ${gm.to} — subject: "${gm.subject}"`);
+		}
+		if (enrichedActivity.calendar) {
+			const cal = enrichedActivity.calendar;
+			if (cal.isNow) parts.push(`meeting NOW: "${cal.summary}" with ${cal.attendees.length} attendees`);
+			else parts.push(`meeting in ${cal.minutesUntil} min: "${cal.summary}"`);
+		}
+		return parts.join("\n");
+	}
+	module.exports = {
+		getSpotifyContext,
+		isLoopingTrack,
+		detectSongLoop,
+		getGmailDraftContext,
+		getCalendarContext,
+		enrichContext,
+		buildContextSummary
+	};
+}));
+//#endregion
 //#region electron/monitors/contextAnalyzer.js
 var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	/**
@@ -1036,6 +1675,7 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 	*/
 	var fs$1 = require("fs");
 	var path$1 = require("path");
+	var { enrichContext, buildContextSummary } = require_contextEnricher();
 	function readEnvVar(key) {
 		try {
 			const envPath = path$1.join(process.cwd(), ".env");
@@ -1061,7 +1701,8 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 					contents: [{ parts: [{ text: prompt }] }],
 					generationConfig: {
 						maxOutputTokens: maxTokens,
-						temperature: .9
+						temperature: .9,
+						thinkingConfig: { thinkingBudget: 0 }
 					}
 				})
 			});
@@ -1091,7 +1732,8 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 					} }] }],
 					generationConfig: {
 						maxOutputTokens: maxTokens,
-						temperature: .9
+						temperature: .9,
+						thinkingConfig: { thinkingBudget: 0 }
 					}
 				})
 			})).json()).candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
@@ -1322,6 +1964,36 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 			]
 		}
 	};
+	async function generateMusicLoopNudge(loopInfo, nsfwMode) {
+		const aiResponse = await callGemini(`you're thera. lowercase. dry. warm underneath.
+
+they've been looping "${loopInfo.track}" by ${loopInfo.artist} for ${loopInfo.totalMinutes} minutes (${loopInfo.playCount} plays).
+
+write ONE short observation or question about the song. max 12 words. lowercase. no quotes.
+
+examples:
+- "that song hits different when you're in your feelings huh"
+- "stuck on ${loopInfo.track}. wanna talk about it?"
+- "${loopInfo.playCount} times in a row. respect the dedication"
+- "looping ${loopInfo.artist}. feeling something or just vibing"
+
+${nsfwMode ? "you can swear if it fits naturally" : "keep it clean"}
+
+respond with ONLY the nudge. nothing else.`, 60);
+		if (!aiResponse || aiResponse.toLowerCase().includes("skip")) {
+			const fallbacks = nsfwMode ? [
+				`${loopInfo.track} on repeat. feeling it or stuck in your head`,
+				`that's ${loopInfo.playCount} plays. the song hits or you're procrastinating`,
+				`looping ${loopInfo.artist}. vibing or spiraling`
+			] : [
+				`still on ${loopInfo.track}. that one really speaks to you huh`,
+				`${loopInfo.playCount} times. the song hits different today`,
+				`looping ${loopInfo.artist}. you okay in there`
+			];
+			return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+		}
+		return aiResponse.replace(/^["']|["']$/g, "").trim();
+	}
 	/**
 	* Pick the right fallback bank based on pattern + current site + nsfwMode
 	*/
@@ -1349,15 +2021,26 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		console.log("[CONTEXT] Activity:", activity.type, "—", activity.detail);
 		console.log("[CONTEXT] NSFW mode:", nsfwMode);
 		if (patterns.length > 0) console.log("[CONTEXT] Patterns:", patterns.map((p) => p.type).join(", "));
+		const enrichedActivity = await enrichContext(activity, currentSession.window_title);
+		const contextSummary = buildContextSummary(enrichedActivity);
+		if (contextSummary !== activity.detail) console.log("[CONTEXT] Enriched context:", contextSummary);
 		if ([
 			"coding",
 			"email-reading",
 			"chatting",
 			"entertainment"
-		].includes(activity.type) && patterns.length === 0) return {
-			shouldNudge: false,
-			reasoning: "user is focused, no concerning patterns"
-		};
+		].includes(activity.type) && patterns.length === 0) {
+			if (enrichedActivity.spotifyLoop) return {
+				shouldNudge: true,
+				message: await generateMusicLoopNudge(enrichedActivity.spotifyLoop, nsfwMode),
+				reasoning: "spotify loop detected",
+				metadata: { spotifyLoop: enrichedActivity.spotifyLoop }
+			};
+			return {
+				shouldNudge: false,
+				reasoning: "user is focused, no concerning patterns"
+			};
+		}
 		const highSeverityPatterns = patterns.filter((p) => p.shouldNudge);
 		if (highSeverityPatterns.length === 0) return {
 			shouldNudge: false,
@@ -1372,6 +2055,14 @@ var require_contextAnalyzer = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		else if (detail.toLowerCase().includes("youtube")) siteContext = "specifically on YouTube (watching videos, autoplaying, rabbit hole)";
 		else if (detail.toLowerCase().includes("tiktok")) siteContext = "specifically on TikTok (for you page, reels)";
 		else if (detail.toLowerCase().includes("twitter") || detail.toLowerCase().includes("x.com")) siteContext = "specifically on Twitter/X (doom-scrolling the feed)";
+		let enrichedContext = "";
+		if (enrichedActivity.spotify) {
+			const sp = enrichedActivity.spotify;
+			enrichedContext += `\n- spotify: ${sp.isPlaying ? "playing" : "paused"} "${sp.track}" by ${sp.artist}`;
+			if (enrichedActivity.spotifyLoop) enrichedContext += ` (on repeat ${enrichedActivity.spotifyLoop.playCount} times)`;
+		}
+		if (enrichedActivity.gmail) enrichedContext += `\n- gmail: drafting to ${enrichedActivity.gmail.to}, subject: "${enrichedActivity.gmail.subject}"`;
+		if (enrichedActivity.calendar?.isNow) enrichedContext += `\n- calendar: meeting NOW "${enrichedActivity.calendar.summary}"`;
 		let prompt = `you're thera. same skull as the fleabag woman. lowercase. dry. warm underneath.
 
 you've caught them doing something concerning. write a nudge.
@@ -1379,7 +2070,7 @@ you've caught them doing something concerning. write a nudge.
 what you know:
 - time: ${timeContext}
 - activity: ${detail}${siteContext ? `\n- context: ${siteContext}` : ""}
-- pattern: ${patternSummary}
+- pattern: ${patternSummary}${enrichedContext}
 
 write ONE short message. max 15 words. lowercase. no quotes. no punctuation at the end unless it's a question mark.
 
@@ -1644,7 +2335,10 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 	}
 	async function pollActiveWindow() {
 		try {
-			const win = await getActiveWindow();
+			const win = await getActiveWindow().catch((e) => {
+				if (e.code !== "EPIPE") console.error("[ACTIVITY] getActiveWindow error:", e.message);
+				return null;
+			});
 			if (!win) {
 				console.log("[ACTIVITY] active-win returned null");
 				if (currentSession) {
@@ -1705,13 +2399,15 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		}
 	}
 	function startMonitoring() {
-		console.log("[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-		console.log("[ACTIVITY] Intelligent Activity Monitor v2 — HYBRID SCREENSHOTS");
-		console.log("[ACTIVITY] Window polling: every", POLL_INTERVAL_MS / 1e3, "seconds");
-		console.log("[ACTIVITY] Nudge checks: every", NUDGE_CHECK_INTERVAL_MS / 1e3, "seconds");
-		console.log("[ACTIVITY] Periodic screenshots: every", SCREENSHOT_INTERVAL_MS / 1e3, "seconds");
-		console.log("[ACTIVITY] Triggered screenshots: when concerning patterns detected");
-		console.log("[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+		try {
+			console.log("[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+			console.log("[ACTIVITY] Intelligent Activity Monitor v2 — HYBRID SCREENSHOTS");
+			console.log("[ACTIVITY] Window polling: every", POLL_INTERVAL_MS / 1e3, "seconds");
+			console.log("[ACTIVITY] Nudge checks: every", NUDGE_CHECK_INTERVAL_MS / 1e3, "seconds");
+			console.log("[ACTIVITY] Periodic screenshots: every", SCREENSHOT_INTERVAL_MS / 1e3, "seconds");
+			console.log("[ACTIVITY] Triggered screenshots: when concerning patterns detected");
+			console.log("[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+		} catch (e) {}
 		sessionHistory = activityOps.getRecentActivity(1).map((row) => ({
 			...row,
 			duration_minutes: row.duration_seconds / 60
@@ -1739,7 +2435,6 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 			console.log("[ACTIVITY] Monitor stopped");
 		}
 	}
-	startMonitoring();
 	process.on("exit", stopMonitoring);
 	module.exports = {
 		startMonitoring,
@@ -1914,6 +2609,19 @@ ipcMain.on("widget-long-press", () => {
 ipcMain.on("move-widget", (_e, { x, y }) => {
 	if (widgetWindow) widgetWindow.setPosition(Math.round(x), Math.round(y));
 });
+ipcMain.handle("get-widget-position", () => {
+	if (widgetWindow) {
+		const [x, y] = widgetWindow.getPosition();
+		return {
+			x,
+			y
+		};
+	}
+	return {
+		x: 0,
+		y: 0
+	};
+});
 ipcMain.on("widget-resize", (_e, { height }) => {
 	if (widgetWindow) {
 		const [w] = widgetWindow.getSize();
@@ -1926,6 +2634,12 @@ ipcMain.on("set-widget-interactive", (_e, interactive) => {
 });
 ipcMain.handle("get-setting", (_e, key) => settings.get(key));
 ipcMain.on("set-setting", (_e, key, value) => settings.set(key, value));
+var widgetActions = require_widgetActions();
+ipcMain.handle("widget:spotify:next", () => widgetActions.spotifyNext());
+ipcMain.handle("widget:spotify:previous", () => widgetActions.spotifyPrevious());
+ipcMain.handle("widget:spotify:toggle", () => widgetActions.spotifyToggle());
+ipcMain.handle("widget:spotify:disable-repeat", () => widgetActions.spotifyDisableRepeat());
+ipcMain.handle("widget:spotify:get-current", () => widgetActions.spotifyGetCurrent());
 ipcMain.handle("sessions:list", () => sessionOps.list());
 ipcMain.handle("sessions:create", (_e, { id, title } = {}) => {
 	const sessionId = id || `thera_${Date.now()}`;
@@ -2098,12 +2812,96 @@ ipcMain.handle("request-permissions", async () => {
 		platform: "unknown"
 	};
 });
+var lastTabData = null;
+var pendingExtCommands = [];
+var longPollWaiters = [];
+function startExtensionBridge() {
+	const server = require("http").createServer((req, res) => {
+		res.setHeader("Access-Control-Allow-Origin", "chrome-extension://");
+		res.setHeader("Access-Control-Allow-Origin", "*");
+		res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+		res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+		if (req.method === "OPTIONS") {
+			res.writeHead(200);
+			res.end();
+			return;
+		}
+		if (req.url === "/tab" && req.method === "POST") {
+			let body = "";
+			req.on("data", (c) => body += c);
+			req.on("end", () => {
+				try {
+					lastTabData = JSON.parse(body);
+					if (widgetWindow) widgetWindow.webContents.send("extension-tab", lastTabData);
+				} catch (_) {}
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+			});
+			return;
+		}
+		if (req.url.startsWith("/commands") && req.method === "GET") {
+			const cmds = pendingExtCommands.splice(0);
+			if (cmds.length > 0 || !req.url.includes("wait=1")) {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify(cmds));
+			} else {
+				const timer = setTimeout(() => {
+					const i = longPollWaiters.findIndex((w) => w.res === res);
+					if (i >= 0) longPollWaiters.splice(i, 1);
+					res.writeHead(200, { "Content-Type": "application/json" });
+					res.end("[]");
+				}, 25e3);
+				longPollWaiters.push({
+					res,
+					timer
+				});
+				req.on("close", () => {
+					clearTimeout(timer);
+					const i = longPollWaiters.findIndex((w) => w.res === res);
+					if (i >= 0) longPollWaiters.splice(i, 1);
+				});
+			}
+			return;
+		}
+		if (req.url === "/ext-command" && req.method === "POST") {
+			let body = "";
+			req.on("data", (c) => body += c);
+			req.on("end", () => {
+				try {
+					pendingExtCommands.push(JSON.parse(body));
+					if (longPollWaiters.length > 0) {
+						const { res: waitRes, timer } = longPollWaiters.shift();
+						clearTimeout(timer);
+						waitRes.writeHead(200, { "Content-Type": "application/json" });
+						waitRes.end(JSON.stringify(pendingExtCommands.splice(0)));
+					}
+				} catch (_) {}
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+			});
+			return;
+		}
+		res.writeHead(404);
+		res.end();
+	});
+	server.on("error", (e) => console.warn("[BRIDGE] Extension bridge error:", e.message));
+	server.listen(7979, "127.0.0.1", () => console.log("[BRIDGE] Extension bridge on port 7979"));
+}
+ipcMain.handle("extension:get-tab", () => lastTabData);
+ipcMain.handle("extension:send-command", (_e, cmd) => {
+	pendingExtCommands.push(cmd);
+	return { ok: true };
+});
 app.whenReady().then(() => {
 	syncConnectorStates();
 	createWindow();
 	createWidgetWindow();
 	createTray();
-	require_activityMonitor();
+	startExtensionBridge();
+	setTimeout(() => {
+		const { startMonitoring } = require_activityMonitor();
+		startMonitoring();
+	}, 2e3);
 });
 app.on("window-all-closed", (e) => {
 	e.preventDefault();

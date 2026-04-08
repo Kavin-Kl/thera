@@ -248,7 +248,11 @@ async function captureTriggeredScreenshot(activity, patterns) {
 
 async function pollActiveWindow() {
   try {
-    const win = await getActiveWindow();
+    const win = await getActiveWindow().catch(e => {
+      // Ignore EPIPE errors from console.log
+      if (e.code !== 'EPIPE') console.error('[ACTIVITY] getActiveWindow error:', e.message);
+      return null;
+    });
 
     if (!win) {
       console.log('[ACTIVITY] active-win returned null');
@@ -333,13 +337,17 @@ async function pollActiveWindow() {
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
 function startMonitoring() {
-  console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('[ACTIVITY] Intelligent Activity Monitor v2 — HYBRID SCREENSHOTS');
-  console.log('[ACTIVITY] Window polling: every', POLL_INTERVAL_MS / 1000, 'seconds');
-  console.log('[ACTIVITY] Nudge checks: every', NUDGE_CHECK_INTERVAL_MS / 1000, 'seconds');
-  console.log('[ACTIVITY] Periodic screenshots: every', SCREENSHOT_INTERVAL_MS / 1000, 'seconds');
-  console.log('[ACTIVITY] Triggered screenshots: when concerning patterns detected');
-  console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  try {
+    console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('[ACTIVITY] Intelligent Activity Monitor v2 — HYBRID SCREENSHOTS');
+    console.log('[ACTIVITY] Window polling: every', POLL_INTERVAL_MS / 1000, 'seconds');
+    console.log('[ACTIVITY] Nudge checks: every', NUDGE_CHECK_INTERVAL_MS / 1000, 'seconds');
+    console.log('[ACTIVITY] Periodic screenshots: every', SCREENSHOT_INTERVAL_MS / 1000, 'seconds');
+    console.log('[ACTIVITY] Triggered screenshots: when concerning patterns detected');
+    console.log('[ACTIVITY] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  } catch (e) {
+    // Ignore EPIPE errors on startup
+  }
 
   // Load recent activity from database to seed history
   sessionHistory = activityOps.getRecentActivity(1).map(row => ({
@@ -374,7 +382,9 @@ function stopMonitoring() {
   }
 }
 
-startMonitoring();
+// Don't start immediately — wait for main process to be ready
+// startMonitoring() is called from main.js after windows are created
+
 process.on('exit', stopMonitoring);
 
 module.exports = { startMonitoring, stopMonitoring };
