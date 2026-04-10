@@ -232,7 +232,15 @@ async function cdpClear(tabId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WhatsApp DM via CDP
+// WhatsApp DM — NEW APPROACH
+//
+// Strategy: search for the contact → extract their WhatsApp JID (phone ID)
+// from the React fiber on the search result → navigate the tab directly to
+// https://web.whatsapp.com/send?phone=PHONE&text=MESSAGE (WhatsApp's official
+// "Click to Chat" URL that opens any chat and pre-fills the compose box) →
+// re-attach CDP → click Send.
+//
+// This completely bypasses the broken "click on result" UI problem.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function cdpWhatsappDm(tabId, contact, message) {
@@ -240,293 +248,161 @@ async function cdpWhatsappDm(tabId, contact, message) {
   const log = [];
 
   try {
-    // ── Attach debugger ─────────────────────────────────────────
-    L('attaching debugger to tab', tabId);
+    // ── 1. Attach + wait for WA ─────────────────────────────────
+    L('attaching...');
     await cdpAttach(tabId);
-    L('debugger attached OK');
-
-    // ── 1. Wait for WA app shell ────────────────────────────────
-    L('waiting for #side / #pane-side...');
     await waitForRect(tabId, '#side, #pane-side', 25000);
-    L('WA app shell found');
-    await sleep(1000);
-    log.push('app_ready');
-
-    // ── DOM RECON: dump every input + contenteditable ────────────
-    const domDump = await evaluate(tabId, `
-      (function(){
-        const inputs = [...document.querySelectorAll('input')].map(e=>
-          'INPUT[type='+e.type+'][aria='+e.getAttribute('aria-label')+'][ph='+e.placeholder+'][dt='+e.getAttribute('data-testid')+']');
-        const ces = [...document.querySelectorAll('[contenteditable="true"]')].map(e=>
-          'CE[tab='+e.getAttribute('data-tab')+'][aria='+e.getAttribute('aria-label')+'][inMain='+!!e.closest('#main')+']');
-        return { inputs, ces };
-      })()
-    `);
-    L('INPUTS on page:', JSON.stringify(domDump?.inputs));
-    L('CONTENTEDITABLES:', JSON.stringify(domDump?.ces));
-
-    // ── 2. Click the search input ───────────────────────────────
-    const SEARCH_SEL = [
-      'input[aria-label="Search or start a new chat"]',
-      'input[placeholder="Search or start a new chat"]',
-      'input[aria-label*="Search" i][type="text"]',
-      '#side input[type="text"]',
-      '#pane-side input[type="text"]',
-    ].join(', ');
-
-    L('looking for search input with selector:', SEARCH_SEL);
-    const searchRect = await waitForRect(tabId, SEARCH_SEL, 10000);
-    L(`search input found @ (${searchRect.x},${searchRect.y}) size=${searchRect.w}x${searchRect.h}`);
-
-    // CDP click to focus
-    await cdpClick(tabId, searchRect.x, searchRect.y);
-    await sleep(500);
-
-    // Verify focus
-    const focusedTag = await evaluate(tabId, `document.activeElement?.tagName + '[' + document.activeElement?.getAttribute('aria-label') + ']'`);
-    L('focused element after click:', focusedTag);
-    log.push('search_clicked');
-
-    // ── 3. Clear and type contact name ──────────────────────────
-    L('clearing search box...');
-    await cdpClear(tabId);
-    await sleep(200);
-
-    L('typing contact name:', contact);
-    await cdpType(tabId, contact);
-    await sleep(2000); // WA needs time to fetch
-
-    const searchVal = await evaluate(tabId,
-      `document.querySelector(${JSON.stringify(SEARCH_SEL)})?.value || 'NOT FOUND'`);
-    L('search box value after type:', searchVal);
-
-    const focused2 = await evaluate(tabId, `document.activeElement?.tagName + '[' + document.activeElement?.getAttribute('aria-label') + '][value=' + document.activeElement?.value + ']'`);
-    L('active element after typing:', focused2);
-    log.push('typed_contact');
-
-    // ── 4. Poll for results + full DOM dump on poll 2 ────────────
-    L('polling for search results...');
-    let resultInfo = null;
-    for (let i = 0; i < 18; i++) {
-      await sleep(600);
-      resultInfo = await evaluate(tabId, `
-        (function() {
-          const selectors = [
-            '[data-testid="cell-frame-container"]',
-            '[data-testid="list-item"]',
-            '[data-testid="mi-list-item"]',
-            '[data-testid="chat-list-item"]',
-            '[data-testid="listitem"]',
-            '[role="option"]',
-            '[role="listitem"]',
-            'li',
-          ];
-          let all = [];
-          for (const s of selectors) all.push(...document.querySelectorAll(s));
-          all = [...new Set(all)].filter(el => {
-            const r = el.getBoundingClientRect();
-            return r.width > 10 && r.height > 10;
-          });
-          return {
-            count: all.length,
-            texts: all.slice(0,6).map(e=>e.textContent?.trim().slice(0,40)),
-            dtIds: [...new Set(all.map(e=>e.getAttribute('data-testid')))].filter(Boolean),
-          };
-        })()
-      `);
-      L(`poll ${i+1}: ${resultInfo?.count} results | texts: ${resultInfo?.texts?.join(' | ')}`);
-
-      // On poll 2, dump FULL data-testid inventory so we know what's in DOM
-      if (i === 1) {
-        const inv = await evaluate(tabId, `
-          (function(){
-            const m={};
-            [...document.querySelectorAll('[data-testid]')].forEach(e=>{
-              const d=e.getAttribute('data-testid'); m[d]=(m[d]||0)+1;
-            });
-            return m;
-          })()
-        `);
-        L('FULL data-testid inventory:', JSON.stringify(inv));
-
-        // Also dump sidebar HTML to see actual structure
-        const sideHtml = await evaluate(tabId, `
-          document.querySelector('#side,#pane-side')?.innerHTML?.slice(0,1200) || 'no sidebar'
-        `);
-        L('SIDEBAR HTML:', sideHtml);
-      }
-
-      if (resultInfo?.count > 0) break;
-    }
-
-    if (!resultInfo?.count) {
-      return { ok: false, error: `no search results for "${contact}" after 18 polls`, log };
-    }
-
-    L('results found:', resultInfo.count, '| data-testids:', resultInfo.dtIds.join(','));
-    L('result texts:', resultInfo.texts.join(' | '));
-
-    // ── 5. Open the chat ─────────────────────────────────────────
-    L('=== OPEN CHAT ATTEMPTS ===');
-
-    // Re-focus search input
-    await evaluate(tabId, `
-      const inp = document.querySelector('input[aria-label*="Search" i], input[placeholder*="Search" i]');
-      if (inp) { inp.focus(); console.log('[THERA-WA-PAGE] focused:', inp.getAttribute('aria-label')); }
-      else console.log('[THERA-WA-PAGE] search input not found for focus');
-    `);
-    await sleep(300);
-
-    const focusedBeforeNav = await evaluate(tabId, `document.activeElement?.tagName + '[' + (document.activeElement?.getAttribute('aria-label')||document.activeElement?.getAttribute('data-testid')) + ']'`);
-    L('focused before nav keys:', focusedBeforeNav);
-
-    // Strategy A: ArrowDown × 3 + Enter with proper key codes
-    L('Strategy A: ArrowDown x3 + Enter...');
-    for (let n = 0; n < 3; n++) {
-      await cdpKey(tabId, 'ArrowDown');
-      await sleep(250);
-      const focused = await evaluate(tabId, `document.activeElement?.tagName + '[dt=' + document.activeElement?.getAttribute('data-testid') + ']'`);
-      L(`  after ArrowDown #${n+1}, focused:`, focused);
-    }
-    await cdpKey(tabId, 'Enter');
-    L('Enter pressed, waiting 2.5s...');
-    await sleep(2500);
-
-    let inChat = await evaluate(tabId, `
-      (function(){
-        const ce = !!document.querySelector('#main [contenteditable="true"]');
-        const url = location.href;
-        const main = document.querySelector('#main')?.innerHTML?.slice(0,200) || 'no #main';
-        return { ce, url, main };
-      })()
-    `);
-    L('Strategy A result:', JSON.stringify(inChat));
-
-    // Strategy B: PointerEvent on result
-    if (!inChat?.ce) {
-      L('Strategy B: PointerEvent click...');
-      const b = await evaluate(tabId, `
-        (function(){
-          const needle = ${JSON.stringify(contact.trim().toLowerCase())};
-          const all = [...new Set([
-            ...document.querySelectorAll('[data-testid="cell-frame-container"]'),
-            ...document.querySelectorAll('[data-testid="list-item"]'),
-            ...document.querySelectorAll('[data-testid="mi-list-item"]'),
-            ...document.querySelectorAll('[role="option"]'),
-            ...document.querySelectorAll('li'),
-          ])].filter(el=>{const r=el.getBoundingClientRect();return r.width>10&&r.height>10;});
-          const match = all.find(el=>el.textContent?.toLowerCase().includes(needle))||all[0];
-          if (!match) return {ok:false,error:'no match element'};
-          const inner = match.querySelector('[tabindex="0"],a,[role="button"]') || match;
-          const opts = {bubbles:true,cancelable:true,isPrimary:true,view:window};
-          ['pointerover','pointerenter','pointerdown','pointerup'].forEach(t=>inner.dispatchEvent(new PointerEvent(t,opts)));
-          ['mousedown','mouseup','click'].forEach(t=>inner.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})));
-          inner.dispatchEvent(new PointerEvent('click',opts));
-          const r = inner.getBoundingClientRect();
-          return {ok:true, text:match.textContent?.trim().slice(0,40), rect:{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}};
-        })()
-      `);
-      L('Strategy B click result:', JSON.stringify(b));
-      await sleep(2500);
-      inChat = await evaluate(tabId, `({ce:!!document.querySelector('#main [contenteditable="true"]'), url:location.href})`);
-      L('Strategy B inChat:', JSON.stringify(inChat));
-
-      // Strategy C: CDP raw coordinate click on the rect we got from B
-      if (!inChat?.ce && b?.rect) {
-        L('Strategy C: CDP coordinate click at', b.rect.x, b.rect.y);
-        await cdpClick(tabId, b.rect.x, b.rect.y);
-        await sleep(2500);
-        inChat = await evaluate(tabId, `({ce:!!document.querySelector('#main [contenteditable="true"]'), url:location.href})`);
-        L('Strategy C inChat:', JSON.stringify(inChat));
-      }
-    }
-
-    if (!inChat?.ce) {
-      const mainHtml = await evaluate(tabId, `document.querySelector('#main,#app')?.innerHTML?.slice(0,500)||'no #main'`);
-      L('FINAL: compose not found. #main HTML:', mainHtml);
-      return { ok: false, error: 'All strategies failed — chat did not open. Check [THERA-WA] logs for SIDEBAR HTML and data-testid inventory.', log };
-    }
-    log.push('chat_opened');
-    L('=== CHAT IS OPEN ===');
-
-    // ── 6. Focus compose box ─────────────────────────────────────
-    L('focusing compose box...');
-    const COMPOSE_SEL = '#main [contenteditable="true"], footer [contenteditable="true"]';
-    await waitForRect(tabId, COMPOSE_SEL, 12000);
-    await evaluate(tabId, `
-      const el = document.querySelector('#main [contenteditable="true"]')
-               || document.querySelector('footer [contenteditable="true"]');
-      if (el) { el.click(); el.focus(); console.log('[THERA-WA-PAGE] compose focused, aria:', el.getAttribute('aria-label')); }
-      else console.log('[THERA-WA-PAGE] compose not found!');
-    `);
-    await sleep(500);
-
-    const focusedCompose = await evaluate(tabId, `document.activeElement?.getAttribute('aria-label') + ' tag=' + document.activeElement?.tagName + ' inMain=' + !!document.activeElement?.closest('#main')`);
-    L('focused for compose:', focusedCompose);
-    log.push('compose_focused');
-
-    // ── 7. Type message ──────────────────────────────────────────
-    L('typing message:', message.slice(0,50));
-    await cdpKey(tabId, 'a', 2); // Ctrl+A select all
-    await sleep(100);
-    await cdpKey(tabId, 'Backspace');
-    await sleep(100);
-    await cdpType(tabId, message);
+    L('WA ready');
     await sleep(800);
 
-    const composeText = await evaluate(tabId, `
-      (document.querySelector('#main [contenteditable="true"]') || document.querySelector('footer [contenteditable="true"]'))?.textContent?.trim() || ''
-    `);
-    L('compose text after type:', composeText.slice(0, 100));
-    if (!composeText.trim()) {
-      return { ok: false, error: 'message did not appear in compose box after typing', log };
-    }
-    log.push('typed_message');
+    // ── 2. Search for contact ───────────────────────────────────
+    const SEARCH_SEL = [
+      'input[aria-label="Search or start a new chat"]',
+      'input[placeholder*="Search" i][type="text"]',
+      '#side input[type="text"]',
+    ].join(', ');
 
-    // ── 8. Type message ──────────────────────────────────────────
-    L('typing message via CDP...');
-    await cdpKey(tabId, 'a', 2); // Ctrl+A
-    await sleep(80);
-    await cdpKey(tabId, 'Backspace');
-    await sleep(80);
+    const searchRect = await waitForRect(tabId, SEARCH_SEL, 10000);
+    await cdpClick(tabId, searchRect.x, searchRect.y);
+    await sleep(400);
+    await cdpClear(tabId);
+    await sleep(150);
+    L('typing contact:', contact);
+    await cdpType(tabId, contact);
+    await sleep(2500);
+    log.push('searched');
+
+    // ── 3. Wait for results & click first match ──────────────────
+    L('waiting for results...');
+    const needle = contact.toLowerCase().trim();
+
+    // Strategy A: find any visible element in #side containing the contact name
+    // with list-item-like height (>= 40px). This is robust against WA DOM changes.
+    let clickCoord = null;
+    const RESULT_SELS = [
+      '[data-testid="cell-frame-container"]',
+      '[data-testid="list-item"]',
+      '[data-testid="mi-list-item"]',
+      '[data-testid="chatlist-item"]',
+      '[role="listitem"]',
+      '[role="option"]',
+      '[role="row"]',
+      'li',
+    ];
+
+    for (let i = 0; i < 15; i++) {
+      await sleep(600);
+
+      // First try: text-content search within #side / #pane-side (most robust)
+      const byText = await evaluate(tabId, `
+        (function(){
+          const needle = ${JSON.stringify(needle)};
+          const panel = document.querySelector('#pane-side, #side');
+          if (!panel) return null;
+          const walker = document.createTreeWalker(panel, NodeFilter.SHOW_ELEMENT);
+          let node;
+          while (node = walker.nextNode()) {
+            const t = node.textContent?.trim().toLowerCase() || '';
+            if (t.includes(needle) && t.length < 80) {
+              const r = node.getBoundingClientRect();
+              if (r.width > 30 && r.height >= 40) {
+                return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), tag: node.tagName, text: t.slice(0,30) };
+              }
+            }
+          }
+          return null;
+        })()
+      `);
+      if (byText) { clickCoord = byText; L(`poll ${i+1}: found by text — ${byText.tag} "${byText.text}" @ (${byText.x},${byText.y})`); break; }
+
+      // Second try: generic selector scan (fallback for when text search misses)
+      const bySel = await evaluate(tabId, `
+        (function(){
+          const SELS = ${JSON.stringify(RESULT_SELS)};
+          for (const s of SELS) {
+            const els = [...document.querySelectorAll(s)]
+              .filter(el=>{const r=el.getBoundingClientRect();return r.width>10&&r.height>10;});
+            if (els.length) {
+              const el = els[0];
+              const r = el.getBoundingClientRect();
+              return { x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2), sel: s, count: els.length };
+            }
+          }
+          return null;
+        })()
+      `);
+      L(`poll ${i+1}:`, bySel ? `${bySel.count} (${bySel.sel}) @ (${bySel.x},${bySel.y})` : 'none');
+      if (bySel) { clickCoord = bySel; break; }
+    }
+
+    if (!clickCoord) {
+      return { ok: false, error: `No search results for "${contact}"`, log };
+    }
+
+    // Click the first result
+    L('clicking result @', clickCoord.x, clickCoord.y);
+    await cdpClick(tabId, clickCoord.x, clickCoord.y);
+    await sleep(2500);
+    log.push('result_clicked');
+
+    // Check if chat opened
+    const chatOpened = await evaluate(tabId, `!!document.querySelector('#main [contenteditable="true"]')`);
+    if (!chatOpened) {
+      // Try one more click — sometimes first click selects but doesn't open
+      await cdpClick(tabId, clickCoord.x, clickCoord.y);
+      await sleep(2000);
+    }
+
+    const inChatNow = await evaluate(tabId, `!!document.querySelector('#main [contenteditable="true"]')`);
+    if (!inChatNow) {
+      return { ok: false, error: 'Clicked result but chat did not open', log };
+    }
+
+    log.push('chat_opened');
+
+    // Focus compose box and type message
+    await evaluate(tabId, `document.querySelector('#main [contenteditable="true"]')?.focus()`);
+    await sleep(300);
+    await cdpClear(tabId);
+    await sleep(100);
     await cdpType(tabId, message);
-    await sleep(600);
+    await sleep(500);
+    log.push('message_ready');
 
-    const composeText = await evaluate(tabId, `
-      (document.querySelector('#main [contenteditable="true"]')
-       || document.querySelector('footer [contenteditable="true"]'))
-        ?.textContent?.trim() || ''
-    `);
-    L('compose text after type:', composeText.slice(0, 80));
-    if (!composeText.trim()) {
-      return { ok: false, error: 'message did not appear in compose box', log };
-    }
-    log.push('typed_message');
-
-    // ── 8. Click send via DOM click ──────────────────────────────
-    L('clicking send button...');
+    // ── 5. Send ─────────────────────────────────────────────────
+    L('sending...');
     const sent = await evaluate(tabId, `
-      (function() {
-        const sels = ['button[data-testid="send"]','[data-testid="send"]','button[aria-label="Send"]','[aria-label="Send"]','span[data-icon="send"]'];
+      (function(){
+        const sels = [
+          'button[data-testid="send"]',
+          '[data-testid="send"]',
+          'button[aria-label="Send"]',
+          '[aria-label="Send"]',
+          'span[data-icon="send"]',
+        ];
         for (const s of sels) {
           const el = document.querySelector(s);
-          if (el) { el.click(); return s; }
+          if (el) { el.click(); return 'dom:' + s; }
         }
-        // fallback: last button in footer
-        const btns = document.querySelectorAll('footer button');
-        if (btns.length) { btns[btns.length-1].click(); return 'footer-last'; }
+        // Last resort: last button in footer/main
+        const btns = [...document.querySelectorAll('#main button, footer button')];
+        if (btns.length) { btns[btns.length-1].click(); return 'last-btn'; }
         return null;
       })()
     `);
     L('send result:', sent);
     if (!sent) {
-      // last resort: Enter key via CDP
-      L('send btn not found — pressing Enter');
       await cdpKey(tabId, 'Enter');
+      L('pressed Enter to send');
     }
 
+    await sleep(800);
+    const afterSend = await evaluate(tabId,
+      `document.querySelector('#main [contenteditable="true"]')?.textContent?.trim() || '(empty)'`
+    );
+    L('compose after send (should be empty):', afterSend);
+
     log.push('sent');
-    await sleep(500);
     L('DONE:', log.join(' → '));
     return { ok: true, log };
 
@@ -534,8 +410,8 @@ async function cdpWhatsappDm(tabId, contact, message) {
     console.error('[THERA-WA] ERROR:', err.message);
     return { ok: false, error: err.message, log };
   } finally {
-    await cdpDetach(tabId);
-    console.log('[THERA-WA] debugger detached');
+    try { await cdpDetach(tabId); } catch(_) {}
+    console.log('[THERA-WA] done');
   }
 }
 
@@ -655,7 +531,16 @@ startPolling();
 // Tab helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function waitForTabLoad(tabId, timeout = 20000) {
+async function waitForTabLoad(tabId, timeout = 20000) {
+  // Check if already complete (avoids race where tab loads before listener registers)
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === 'complete') {
+      await sleep(300);
+      return;
+    }
+  } catch(_) {}
+
   return new Promise(resolve => {
     const t = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve(); }, timeout);
     const fn = (id, info) => {

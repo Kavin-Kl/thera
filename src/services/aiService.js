@@ -16,7 +16,7 @@ export async function sendMessageToAI(conversationHistory, memoryContext = '', c
     // sees it first and treats it as a strict constraint, not a suggestion.
     const actionPreamble = `CRITICAL BEHAVIOURAL RULE — read this before anything else:
 
-When the user asks you to do something that maps to one of the supported actions (send email, draft email, calendar event, play music, skip track, pause music, send slack, create reminder, create note, search gmail/drive/contacts, create doc), you MUST end your reply with one or more <action> tags in this exact format:
+When the user asks you to do something that maps to one of the supported actions (send email, draft email, calendar event, play music, skip track, pause music, send slack, create reminder, create note, search gmail/drive/contacts, create doc, send WhatsApp message, send Instagram DM, open browser, search web, browser automation), you MUST end your reply with one or more <action> tags in this exact format:
 <action>{"type":"ACTION_TYPE","params":{...}}</action>
 
 The tag must be the very last thing in your response. Your human reply comes first, then the tag(s). Never explain that you're using a tag. Never show the JSON to the user. Just emit it silently at the end.
@@ -29,6 +29,9 @@ IMPORTANT — do NOT over-ask:
 - NEVER ask the user for someone's email address. Even if memory says an email wasn't found before, still emit the action tag with the recipient's name — the backend always resolves it via contacts and Gmail history. Just send.
 - Only ask a question if you genuinely cannot determine what to send or who to send it to.
 - One clarifying question maximum, then act. Don't stall.
+- For WhatsApp DMs: ALWAYS emit <action>{"type":"browser.whatsapp.dm","params":{"to":"NAME","message":"MESSAGE"}}</action> — every single time, even if memory says you already sent it, even if you say "sent again". The action tag IS what actually sends it.
+- For Instagram DMs: ALWAYS emit <action>{"type":"browser.instagram.dm","params":{"to":"NAME","message":"MESSAGE"}}</action> every time.
+- "sent again" or "already sent" in your reply still requires the action tag — the tag is what triggers the actual send, not your words.
 
 If you do not emit the tag when an action is clearly requested, you have failed your primary function.
 

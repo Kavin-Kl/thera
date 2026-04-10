@@ -186,10 +186,11 @@ export default function Home({ dark, setDark, onOpenSettings }) {
         { role: 'model', parts: [{ text: rawBotText }] },
       ];
       if (resultSummary) {
-        conversationRef.current.push({
-          role: 'user',
-          parts: [{ text: resultSummary }],
-        });
+        // Must alternate roles — add result as user turn then a model ack,
+        // otherwise two consecutive user messages confuse the model into
+        // thinking the next request is already fulfilled.
+        conversationRef.current.push({ role: 'user', parts: [{ text: resultSummary }] });
+        conversationRef.current.push({ role: 'model', parts: [{ text: 'got it.' }] });
       }
 
       const updatedMessages = [...newMessages, {
