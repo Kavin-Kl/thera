@@ -34,7 +34,7 @@ const TABS = [
   { id: 'about',      label: 'about' },
 ];
 
-export default function Settings({ dark, onClose }) {
+export default function Settings({ dark, onClose, onSignOut }) {
   const T = dark ? DARK : LIGHT;
   const [tab, setTab] = useState('connectors');
   const [nsfwMode, setNsfwMode] = useState(false);
@@ -181,6 +181,29 @@ export default function Settings({ dark, onClose }) {
                   T={T}
                 />
               </Row>
+
+              {onSignOut && (
+                <Row T={T}>
+                  <div>
+                    <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: T.TEXT }}>reset & restart</p>
+                    <p style={{ margin: '4px 0 0', fontSize: 12, color: T.MUTED }}>
+                      clears onboarding and starts fresh. useful for demos.
+                    </p>
+                  </div>
+                  <button
+                    onClick={onSignOut}
+                    style={{
+                      background: 'transparent', border: `1px solid ${T.BORDER}`,
+                      borderRadius: 50, padding: '8px 16px',
+                      fontFamily: MONO, fontSize: 10, letterSpacing: '1.4px',
+                      textTransform: 'uppercase', color: T.MUTED, cursor: 'pointer',
+                      flexShrink: 0, transition: 'border-color 0.2s, color 0.2s',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = CORAL; e.currentTarget.style.color = CORAL; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = T.BORDER; e.currentTarget.style.color = T.MUTED; }}
+                  >sign out</button>
+                </Row>
+              )}
             </motion.div>
           )}
 

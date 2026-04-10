@@ -3,8 +3,8 @@
   "name": "Thera Bridge",
   "version": "1.0.0",
   "description": "Connects your browser to the Thera desktop app",
-  "permissions": ["tabs", "activeTab", "storage", "alarms"],
-  "host_permissions": ["http://127.0.0.1:7979/*"],
+  "permissions": ["tabs", "activeTab", "storage", "alarms", "scripting"],
+  "host_permissions": ["http://127.0.0.1:7979/*", "https://*/*", "http://localhost:7979/*"],
   "background": {
     "service_worker": "background.js"
   },

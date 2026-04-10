@@ -433,20 +433,29 @@ const longPollWaiters = []; // resolve functions waiting for next command
 function startExtensionBridge() {
   const http = require('http');
   const server = http.createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', 'chrome-extension://');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+    // Required for Chrome/Edge Manifest V3 extensions fetching localhost (Private Network Access)
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     if (req.url === '/tab' && req.method === 'POST') {
       let body = '';
       req.on('data', c => body += c);
       req.on('end', () => {
         try {
-          lastTabData = JSON.parse(body);
-          if (widgetWindow) widgetWindow.webContents.send('extension-tab', lastTabData);
-        } catch (_) {}
+          const data = JSON.parse(body);
+          if (data.type === 'automate-result') {
+            console.log('[BRIDGE] automate-result received:', JSON.stringify(data).slice(0, 300));
+            const win = widgetWindow || mainWindow;
+            if (win) win.webContents.send('extension-automate-result', data);
+            else console.warn('[BRIDGE] automate-result: no window to send to');
+          } else {
+            lastTabData = data;
+            if (widgetWindow) widgetWindow.webContents.send('extension-tab', data);
+          }
+        } catch (e) { console.error('[BRIDGE] /tab parse error:', e.message); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       });
@@ -456,11 +465,12 @@ function startExtensionBridge() {
     if (req.url.startsWith('/commands') && req.method === 'GET') {
       const cmds = pendingExtCommands.splice(0);
       if (cmds.length > 0 || !req.url.includes('wait=1')) {
-        // Return immediately if commands are waiting, or if not long-polling
+        if (cmds.length > 0) console.log('[BRIDGE] /commands returning immediately:', cmds.map(c=>c.type));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(cmds));
       } else {
         // Long-poll: hold the response for up to 25s, flush when command arrives
+        console.log('[BRIDGE] /commands long-poll registered, waiters now:', longPollWaiters.length + 1);
         const timer = setTimeout(() => {
           const i = longPollWaiters.findIndex(w => w.res === res);
           if (i >= 0) longPollWaiters.splice(i, 1);
@@ -483,15 +493,21 @@ function startExtensionBridge() {
       req.on('data', c => body += c);
       req.on('end', () => {
         try {
-          pendingExtCommands.push(JSON.parse(body));
+          const cmd = JSON.parse(body);
+          console.log('[BRIDGE] /ext-command received:', cmd.type, 'taskId:', cmd.taskId, '| waiters:', longPollWaiters.length);
+          pendingExtCommands.push(cmd);
           // Immediately flush to any waiting long-poll connection
           if (longPollWaiters.length > 0) {
             const { res: waitRes, timer } = longPollWaiters.shift();
             clearTimeout(timer);
+            const toFlush = pendingExtCommands.splice(0);
+            console.log('[BRIDGE] flushing to long-poll waiter:', toFlush.map(c=>c.type));
             waitRes.writeHead(200, { 'Content-Type': 'application/json' });
-            waitRes.end(JSON.stringify(pendingExtCommands.splice(0)));
+            waitRes.end(JSON.stringify(toFlush));
+          } else {
+            console.warn('[BRIDGE] no long-poll waiter — command queued, extension will pick up next poll (extension connected?)');
           }
-        } catch (_) {}
+        } catch (e) { console.error('[BRIDGE] /ext-command parse error:', e.message); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       });

@@ -44,6 +44,7 @@ function App() {
       try {
         const completed = await ipcRenderer?.invoke('get-setting', 'onboardingCompleted');
         if (completed) {
+          setIntroDone(true); // skip intro animation on subsequent opens
           setShowHome(true);
         }
       } catch (err) {
@@ -107,6 +108,7 @@ function App() {
             transition={{ duration: 1 }}
           >
             <Home dark={dark} setDark={setDark} onOpenSettings={() => setShowSettings(true)} />
+
           </motion.div>
         )}
 
@@ -114,7 +116,13 @@ function App() {
 
       <AnimatePresence>
         {showSettings && (
-          <Settings dark={dark} onClose={() => setShowSettings(false)} />
+          <Settings dark={dark} onClose={() => setShowSettings(false)} onSignOut={async () => {
+            ipcRenderer?.send('set-setting', 'onboardingCompleted', false);
+            ipcRenderer?.send('set-setting', 'onboardingData', null);
+            setShowSettings(false);
+            setShowHome(false);
+            setIntroDone(false);
+          }} />
         )}
       </AnimatePresence>
 

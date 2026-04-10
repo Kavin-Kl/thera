@@ -335,14 +335,31 @@ async function slackSearch({ query }) {
 // Requires the Thera Bridge extension + bridge server running (port 7979)
 async function sendExtensionCommand(cmd) {
   const http = require('http');
+  console.log('[ACTIONS] sendExtensionCommand:', cmd.type, 'taskId:', cmd.taskId);
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(cmd);
-    const req = http.request({ hostname: '127.0.0.1', port: 7979, path: '/ext-command', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
-      (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(JSON.parse(d || '{}'))); }
+    const req = http.request(
+      { hostname: '127.0.0.1', port: 7979, path: '/ext-command', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (res) => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => {
+          console.log('[ACTIONS] sendExtensionCommand response status:', res.statusCode, 'body:', d.slice(0,100));
+          try { resolve(JSON.parse(d || '{}')); } catch(_) { resolve({}); }
+        });
+      }
     );
-    req.on('error', reject);
-    req.write(body); req.end();
+    req.on('error', (e) => {
+      console.error('[ACTIONS] sendExtensionCommand FAILED (bridge not running?):', e.message);
+      reject(e);
+    });
+    req.setTimeout(5000, () => {
+      console.error('[ACTIONS] sendExtensionCommand timed out after 5s');
+      req.destroy(new Error('timeout'));
+    });
+    req.write(body);
+    req.end();
   });
 }
 
@@ -366,13 +383,15 @@ async function browserSearch({ query, engine = 'google' }) {
 }
 
 async function browserWhatsappDm({ to, message }) {
-  await sendExtensionCommand({ type: 'whatsapp-dm', to, message });
-  return { sent: true, to, platform: 'whatsapp' };
+  const taskId = `wa_${Date.now()}`;
+  await sendExtensionCommand({ type: 'whatsapp-dm', to, message, taskId });
+  return { sent: true, to, platform: 'whatsapp', taskId };
 }
 
 async function browserInstagramDm({ to, message }) {
-  await sendExtensionCommand({ type: 'instagram-dm', to, message });
-  return { sent: true, to, platform: 'instagram', note: 'may need you logged in' };
+  const taskId = `ig_${Date.now()}`;
+  await sendExtensionCommand({ type: 'instagram-dm', to, message, taskId });
+  return { sent: true, to, platform: 'instagram', taskId };
 }
 
 async function browserAutomate({ url, steps, waitAfterNav }) {

@@ -149,7 +149,7 @@ function detectActivity(appName, windowTitle) {
 
   // ── Instagram / TikTok / Twitter ───────────────────────────────────
   if (title.includes('instagram')) return { type: 'social-scrolling', confidence: 'high', detail: 'instagram' };
-  if (title.includes('tiktok'))    return { type: 'social-scrolling', confidence: 'high', detail: 'tiktok' };
+  if (title.includes('tiktok')) return { type: 'social-scrolling', confidence: 'high', detail: 'tiktok' };
   if (title.includes('twitter') || title.includes('x.com')) return { type: 'social-scrolling', confidence: 'high', detail: 'twitter' };
 
   // ── Google Docs / Sheets ───────────────────────────────────────────
