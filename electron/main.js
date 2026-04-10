@@ -35,8 +35,8 @@ let store;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 400,
-    height: 600,
+    width: 900,
+    height: 627,
     minWidth: 350,
     minHeight: 500,
     frame: false,
@@ -156,16 +156,9 @@ function createWidgetWindow() {
 }
 
 function createTray() {
-  // Create a simple programmatic tray icon (orange square - thera's brand color)
   const { nativeImage } = require('electron');
 
-  // Create a 16x16 orange square icon
-  const iconCanvas = nativeImage.createEmpty();
-  const iconSize = 16;
-
-  // Simple fallback - use system default or create from base64
-  const iconData = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABOSURBVDiNY/z//z8DJYCRUgNgYBgF+MDu3bv/M1AJmDZtGvUMuHjx4n8GKgHLly+nngFoYBTgY8C1a9f+M1AJWLhwIfUMgIFRAFYBANJ4Cul0TKhpAAAAAElFTkSuQmCC';
-  const trayIcon = nativeImage.createFromDataURL(iconData);
+  const trayIcon = nativeImage.createFromPath(path.join(__dirname, '..', 'thera.png'));
 
   tray = new Tray(trayIcon);
 

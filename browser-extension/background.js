@@ -294,20 +294,42 @@ async function cdpWhatsappDm(tabId, contact, message) {
       await sleep(600);
 
       // First try: text-content search within #side / #pane-side (most robust)
+      // Find the DIRECT chat row — not group mention rows — by looking for the
+      // element whose own text most closely matches the needle, then walk up
+      // to the row (height 40–150px). Cap height to avoid overshooting into
+      // section containers whose center Y falls in the wrong area.
       const byText = await evaluate(tabId, `
         (function(){
           const needle = ${JSON.stringify(needle)};
           const panel = document.querySelector('#pane-side, #side');
           if (!panel) return null;
+
+          // Collect all candidate leaf nodes whose text contains the needle
           const walker = document.createTreeWalker(panel, NodeFilter.SHOW_ELEMENT);
+          const candidates = [];
           let node;
           while (node = walker.nextNode()) {
-            const t = node.textContent?.trim().toLowerCase() || '';
-            if (t.includes(needle) && t.length < 80) {
-              const r = node.getBoundingClientRect();
-              if (r.width > 30 && r.height >= 40) {
-                return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), tag: node.tagName, text: t.slice(0,30) };
+            const t = (node.textContent || '').trim().toLowerCase();
+            if (!t.includes(needle)) continue;
+            // Prefer nodes where the needle IS the primary text (not a mention)
+            // Score: lower = better (closer length to needle = more direct match)
+            const score = t.length - needle.length;
+            candidates.push({ node, t, score });
+          }
+
+          // Sort by score: direct name matches first
+          candidates.sort((a, b) => a.score - b.score);
+
+          for (const { node, t } of candidates) {
+            // Walk up to the nearest row-like element (height 40–150px, wide enough)
+            let el = node;
+            for (let up = 0; up < 10; up++) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 80 && r.height >= 40 && r.height <= 150) {
+                return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), tag: el.tagName, text: t.slice(0,40) };
               }
+              if (!el.parentElement || el.parentElement === panel) break;
+              el = el.parentElement;
             }
           }
           return null;

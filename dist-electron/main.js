@@ -2494,8 +2494,8 @@ var widgetWindow;
 var tray;
 function createWindow() {
 	mainWindow = new BrowserWindow({
-		width: 400,
-		height: 600,
+		width: 900,
+		height: 627,
 		minWidth: 350,
 		minHeight: 500,
 		frame: false,
@@ -2573,8 +2573,7 @@ function createWidgetWindow() {
 }
 function createTray() {
 	const { nativeImage } = require("electron");
-	nativeImage.createEmpty();
-	tray = new Tray(nativeImage.createFromDataURL("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABOSURBVDiNY/z//z8DJYCRUgNgYBgF+MDu3bv/M1AJmDZtGvUMuHjx4n8GKgHLly+nngFoYBTgY8C1a9f+M1AJWLhwIfUMgIFRAFYBANJ4Cul0TKhpAAAAAElFTkSuQmCC"));
+	tray = new Tray(nativeImage.createFromPath(path.join(__dirname, "..", "thera.png")));
 	const contextMenu = Menu.buildFromTemplate([
 		{
 			label: "Show Thera",
