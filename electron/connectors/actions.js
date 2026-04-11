@@ -30,6 +30,7 @@ const googleAuth = require('./google');
 const spotify = require('./spotify');
 const slack = require('./slack');
 const { db } = require('../db/localDb');
+const bridgeClient = require('../bridgeClient');
 
 // Lazily ensure built-in tables exist
 db.exec(`
@@ -395,8 +396,156 @@ async function browserInstagramDm({ to, message }) {
 }
 
 async function browserAutomate({ url, steps, waitAfterNav }) {
-  await sendExtensionCommand({ type: 'automate', url, steps, waitAfterNav, taskId: `task_${Date.now()}` });
+  const taskId = `task_${Date.now()}`;
+  await sendExtensionCommand({ type: 'automate', url, steps, waitAfterNav, taskId });
   return { ok: true };
+}
+
+// ── AI-driven agentic browser automation ──────────────────────────────────────
+
+async function sendExtensionCommandAndWait(cmd, timeoutMs = 45000) {
+  await sendExtensionCommand(cmd);
+  return bridgeClient.waitForTask(cmd.taskId, timeoutMs);
+}
+
+/** Read the active tab's DOM context — URL, title, text, interactive elements. */
+async function getPageContext() {
+  const taskId = `read_${Date.now()}`;
+  try {
+    const result = await sendExtensionCommandAndWait({ type: 'read-page', taskId }, 15000);
+    return result;
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function browserAiTask({ goal, url }) {
+  let GoogleGenAI;
+  try {
+    ({ GoogleGenAI } = require('@google/genai'));
+  } catch (e) {
+    throw new Error('GoogleGenAI not available in main process: ' + e.message);
+  }
+
+  const ai = new GoogleGenAI({ apiKey: process.env.VITE_GEMINI_API_KEY });
+
+  // Navigate to starting URL if provided
+  if (url) {
+    await sendExtensionCommand({ type: 'open-url', url, newTab: true });
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  const MAX_ITERATIONS = 12;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    console.log(`[AI-TASK] iteration ${i + 1}/${MAX_ITERATIONS}, goal: ${goal}`);
+
+    // Read DOM instead of taking a screenshot — much faster and cheaper
+    const page = await getPageContext();
+    if (!page.ok) {
+      console.warn('[AI-TASK] read-page failed:', page.error);
+      if (i === 0) throw new Error('Could not read browser page: ' + page.error);
+      // If mid-task, give it another iteration (page might be loading)
+      await sleep(2000);
+      continue;
+    }
+
+    // Format interactive elements for the prompt
+    const interactiveStr = page.interactive?.length
+      ? '\n\nINTERACTIVE ELEMENTS ON PAGE:\n' + page.interactive.map(el => {
+          if (el.type === 'button') return `  [BTN] "${el.text}"${el.sel ? '  sel=' + el.sel : ''}`;
+          if (el.type === 'input')  return `  [INPUT] placeholder="${el.placeholder}"${el.sel ? '  sel=' + el.sel : ''}${el.value ? '  current="' + el.value + '"' : ''}`;
+          if (el.type === 'link')   return `  [LINK] "${el.text}"  href=${el.href}`;
+          if (el.type === 'select') return `  [SELECT]${el.sel ? ' sel=' + el.sel : ''}  options=[${el.options?.join(', ')}]`;
+          return '';
+        }).filter(Boolean).join('\n')
+      : '';
+
+    const prompt = `You are Thera's browser automation agent.
+
+GOAL: "${goal}"
+ITERATION: ${i + 1} of ${MAX_ITERATIONS}
+
+CURRENT PAGE:
+URL: ${page.url || 'unknown'}
+TITLE: ${page.title || 'unknown'}
+
+PAGE TEXT:
+${(page.text || '(empty)').slice(0, 2500)}
+${interactiveStr}
+
+Decide the next steps to make progress toward the goal. Reply with ONLY a JSON object — no markdown, no explanation:
+{
+  "done": false,
+  "summary": "",
+  "steps": [
+    {"action": "navigate", "url": "FULL_URL"},
+    {"action": "click", "selector": "CSS_SELECTOR", "timeout": 8000},
+    {"action": "click-text", "text": "EXACT_VISIBLE_BUTTON_OR_LINK_TEXT"},
+    {"action": "type", "selector": "CSS_SELECTOR", "text": "TEXT_TO_TYPE", "clear": true},
+    {"action": "press", "key": "Enter"},
+    {"action": "scroll", "amount": 400},
+    {"action": "wait", "selector": "CSS_SELECTOR", "timeout": 8000},
+    {"action": "sleep", "ms": 1500}
+  ]
+}
+
+Rules:
+- If the goal is accomplished (visible in page text above), set "done": true with summary of what happened.
+- Use "navigate" step to go to a URL — don't use a separate field.
+- Prefer "click-text" with exact visible text from INTERACTIVE ELEMENTS when you can see the element listed.
+- Prefer selectors from INTERACTIVE ELEMENTS (sel=...) over guessing class names.
+- For search: type in the input field, then press Enter.
+- Keep steps to 2–5 per iteration. The loop reads the page again after each batch.
+- If page text shows a captcha or visual challenge, use {"action": "sleep", "ms": 3000} and we'll deal with it next turn.
+- If you're stuck on the same page, try navigating to a more specific URL.
+- NEVER set done:true unless the page text confirms the task is complete.`;
+
+    let decision;
+    try {
+      const result = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: { maxOutputTokens: 512, thinkingConfig: { thinkingBudget: 0 } },
+      });
+      const raw = result.text?.trim() || '{}';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) { console.warn('[AI-TASK] no JSON in response:', raw.slice(0, 200)); break; }
+      decision = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.error('[AI-TASK] Gemini/parse error:', e.message);
+      break;
+    }
+
+    console.log('[AI-TASK] decision:', JSON.stringify(decision).slice(0, 400));
+
+    if (decision.done) {
+      return { ok: true, summary: decision.summary || `completed: ${goal}`, iterations: i + 1 };
+    }
+
+    if (!decision.steps?.length) {
+      console.warn('[AI-TASK] no steps and not done — stopping');
+      break;
+    }
+
+    // Execute steps via CDP in the extension (no content script, no screenshots)
+    const taskId = `ai_${Date.now()}`;
+    try {
+      const stepResult = await sendExtensionCommandAndWait(
+        { type: 'automate-cdp', steps: decision.steps, taskId },
+        40000
+      );
+      console.log('[AI-TASK] step results:', JSON.stringify(stepResult?.results || []).slice(0, 300));
+    } catch (e) {
+      console.warn('[AI-TASK] steps timed out or failed:', e.message, '— continuing');
+    }
+
+    // Wait for page to settle before reading DOM again
+    await sleep(2500);
+  }
+
+  return { ok: true, summary: `attempted: ${goal}`, iterations: MAX_ITERATIONS };
 }
 
 // ── Built-ins ─────────────────────────────────────────────────────
@@ -436,6 +585,7 @@ const HANDLERS = {
   'browser.whatsapp.dm': browserWhatsappDm,
   'browser.instagram.dm': browserInstagramDm,
   'browser.automate': browserAutomate,
+  'browser.ai_task': browserAiTask,
 };
 
 async function execute({ type, params = {} }) {

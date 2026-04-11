@@ -29,6 +29,7 @@ const slackConnector = require('./connectors/slack');
 const actions = require('./connectors/actions');
 const tokenStore = require('./connectors/tokenStore');
 const { runOAuthFlow } = require('./connectors/oauthLoopback');
+const bridgeClient = require('./bridgeClient');
 
 let mainWindow;
 let widgetWindow;
@@ -72,17 +73,14 @@ function createWindow() {
     }
   });
 
-  // When main window becomes visible → hide widget
+  // macOS tray highlight when main window is shown
   mainWindow.on('show', () => {
     if (process.platform === 'darwin' && tray && tray.setHighlightMode) {
       tray.setHighlightMode('always');
     }
-    if (widgetWindow && !widgetWindow.isDestroyed()) {
-      widgetWindow.webContents.send('widget-visibility', false);
-    }
   });
 
-  // When main window is hidden → show widget
+  // When main window is hidden → ensure widget is visible
   mainWindow.on('hide', () => {
     if (widgetWindow && !widgetWindow.isDestroyed()) {
       widgetWindow.webContents.send('widget-visibility', true);
@@ -159,6 +157,9 @@ function createWidgetWindow() {
 
   widgetWindow.webContents.on('did-finish-load', () => {
     console.log('[WIDGET] Widget finished loading');
+    // Send initial visibility — show widget unless main window is currently open & visible
+    const mainVisible = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
+    widgetWindow.webContents.send('widget-visibility', !mainVisible);
   });
 
   widgetWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
@@ -580,6 +581,24 @@ ipcMain.handle('roast:context', () => {
   return { moodDays, moodRecent, activity };
 });
 
+// Screen capture for AI context (Tier 3 — on-demand, main-process only in Electron 20+)
+ipcMain.handle('screen:capture', async () => {
+  const { desktopCapturer, screen } = require('electron');
+  try {
+    const { width, height } = screen.getPrimaryDisplay().bounds;
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: Math.round(width / 2), height: Math.round(height / 2) },
+    });
+    if (!sources.length) return { ok: false, error: 'no screen sources found' };
+    const dataURL = sources[0].thumbnail.toDataURL('image/jpeg', 0.7);
+    return { ok: true, base64: dataURL.split(',')[1], mimeType: 'image/jpeg' };
+  } catch (e) {
+    console.error('[SCREEN] capture error:', e.message);
+    return { ok: false, error: e.message };
+  }
+});
+
 // Permission requests
 ipcMain.handle('request-permissions', async () => {
   const { systemPreferences } = require('electron');
@@ -632,11 +651,13 @@ function startExtensionBridge() {
       req.on('end', () => {
         try {
           const data = JSON.parse(body);
-          if (data.type === 'automate-result') {
-            console.log('[BRIDGE] automate-result received:', JSON.stringify(data).slice(0, 300));
+          if (data.type === 'automate-result' || data.type === 'screenshot-result') {
+            console.log('[BRIDGE]', data.type, 'received taskId:', data.taskId, JSON.stringify(data).slice(0, 200));
+            // Resolve any pending waitForTask() in actions.js
+            bridgeClient.resolveTask(data.taskId, data.result || data);
             const win = widgetWindow || mainWindow;
             if (win) win.webContents.send('extension-automate-result', data);
-            else console.warn('[BRIDGE] automate-result: no window to send to');
+            else console.warn('[BRIDGE]', data.type, ': no window to send to');
           } else {
             lastTabData = data;
             if (widgetWindow) widgetWindow.webContents.send('extension-tab', data);

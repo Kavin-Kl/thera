@@ -3,7 +3,7 @@ import { systemPrompt } from './systemPrompt';
 
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
-export async function sendMessageToAI(conversationHistory, memoryContext = '', customSystemPrompt = null) {
+export async function sendMessageToAI(conversationHistory, memoryContext = '', customSystemPrompt = null, screenshot = null) {
   try {
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
@@ -16,7 +16,7 @@ export async function sendMessageToAI(conversationHistory, memoryContext = '', c
     // sees it first and treats it as a strict constraint, not a suggestion.
     const actionPreamble = `CRITICAL BEHAVIOURAL RULE — read this before anything else:
 
-When the user asks you to do something that maps to one of the supported actions (send email, draft email, calendar event, play music, skip track, pause music, send slack, create reminder, create note, search gmail/drive/contacts, create doc, send WhatsApp message, send Instagram DM, open browser, search web, browser automation), you MUST end your reply with one or more <action> tags in this exact format:
+When the user asks you to do something that maps to one of the supported actions (send email, draft email, calendar event, play music, skip track, pause music, send slack, create reminder, create note, search gmail/drive/contacts, create doc, send WhatsApp message, send Instagram DM, open browser, search web, browser automation, book tickets, play YouTube videos, buy things, fill forms, order food, any browser task whatsoever), you MUST end your reply with one or more <action> tags in this exact format:
 <action>{"type":"ACTION_TYPE","params":{...}}</action>
 
 The tag must be the very last thing in your response. Your human reply comes first, then the tag(s). Never explain that you're using a tag. Never show the JSON to the user. Just emit it silently at the end.
@@ -38,9 +38,27 @@ If you do not emit the tag when an action is clearly requested, you have failed 
 ---
 `;
 
+    // Inject screenshot into the last user message if screen-aware mode is on
+    let contents = conversationHistory;
+    if (screenshot?.base64 && conversationHistory.length > 0) {
+      const last = conversationHistory[conversationHistory.length - 1];
+      if (last.role === 'user') {
+        contents = [
+          ...conversationHistory.slice(0, -1),
+          {
+            role: 'user',
+            parts: [
+              ...last.parts,
+              { inlineData: { mimeType: screenshot.mimeType || 'image/jpeg', data: screenshot.base64 } },
+            ],
+          },
+        ];
+      }
+    }
+
     const result = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
-      contents: conversationHistory,
+      contents,
       config: {
         systemInstruction: actionPreamble + basePrompt + memoryPriming,
         maxOutputTokens: customSystemPrompt ? 256 : 2048,

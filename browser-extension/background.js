@@ -670,7 +670,10 @@ async function dispatch(cmd) {
         if (cmd.url) {
           const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
           tabId = tabs[0]?.id;
-          if (!tabId) { console.warn('[THERA-BRIDGE] automate: no active tab'); break; }
+          if (!tabId) {
+            await reportResult(cmd.taskId, { ok: false, error: 'no active tab' });
+            break;
+          }
           await chrome.tabs.update(tabId, { url: cmd.url, active: true });
           await waitForTabLoad(tabId);
           await sleep(cmd.waitAfterNav || 2000);
@@ -679,9 +682,227 @@ async function dispatch(cmd) {
           const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
           tabId = tabs[0]?.id;
         }
-        if (!tabId || !cmd.steps?.length) { console.warn('[THERA-BRIDGE] automate: no tabId or steps'); break; }
-        const result = await sendToTab(tabId, { type: 'automate-steps', steps: cmd.steps });
+        if (!tabId || !cmd.steps?.length) {
+          await reportResult(cmd.taskId, { ok: false, error: 'no tabId or steps' });
+          break;
+        }
+        let result;
+        try {
+          result = await sendToTab(tabId, { type: 'automate-steps', steps: cmd.steps });
+        } catch (e) {
+          result = { ok: false, error: e.message };
+        }
         await reportResult(cmd.taskId, result);
+        break;
+      }
+
+      // ── Screenshot — capture visible tab ────────────────────────
+      case 'screenshot': {
+        try {
+          const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 65 });
+          const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+          const tab = tabs[0] || {};
+          await reportResult(cmd.taskId, { ok: true, dataUrl, url: tab.url || '', title: tab.title || '' });
+        } catch (e) {
+          console.error('[THERA-BRIDGE] screenshot error:', e.message);
+          await reportResult(cmd.taskId, { ok: false, error: e.message });
+        }
+        break;
+      }
+
+      // ── Read page — structured DOM context for AI agent ──────────
+      case 'read-page': {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tabId = tabs[0]?.id;
+        if (!tabId) { await reportResult(cmd.taskId, { ok: false, error: 'no active tab' }); break; }
+        try {
+          await cdpAttach(tabId);
+          const pageInfo = await evaluate(tabId, `
+            (function() {
+              const url   = location.href;
+              const title = document.title;
+              const text  = (document.body?.innerText || '').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').slice(0, 3000);
+
+              const interactive = [];
+
+              // Buttons (visible only)
+              document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60);
+                if (!text) return;
+                const sel = el.id ? '#' + CSS.escape(el.id)
+                  : el.getAttribute('data-testid') ? '[data-testid="' + el.getAttribute('data-testid') + '"]'
+                  : null;
+                interactive.push({ type: 'button', text, sel });
+              });
+
+              // Inputs / textareas / contenteditables
+              document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, [contenteditable="true"], [role="textbox"]').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                const ph = (el.placeholder || el.getAttribute('aria-label') || el.name || el.id || '').slice(0, 60);
+                const sel = el.id ? '#' + CSS.escape(el.id)
+                  : el.name ? '[name="' + el.name + '"]'
+                  : null;
+                interactive.push({ type: 'input', placeholder: ph, sel, value: (el.value || '').slice(0, 40) });
+              });
+
+              // Links — top 15 visible, non-trivial ones
+              const seen = new Set();
+              let linkCount = 0;
+              document.querySelectorAll('a[href]').forEach(el => {
+                if (linkCount >= 15) return;
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                const text = el.textContent?.trim().slice(0, 60);
+                if (!text || seen.has(text)) return;
+                seen.add(text);
+                interactive.push({ type: 'link', text, href: el.href?.slice(0, 120) });
+                linkCount++;
+              });
+
+              // Selects
+              document.querySelectorAll('select').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                const sel = el.id ? '#' + CSS.escape(el.id) : (el.name ? '[name="' + el.name + '"]' : null);
+                const options = [...el.options].map(o => o.text.trim()).slice(0, 8);
+                interactive.push({ type: 'select', sel, options });
+              });
+
+              return { url, title, text, interactive: interactive.slice(0, 50) };
+            })()
+          `);
+          await cdpDetach(tabId);
+          await reportResult(cmd.taskId, { ok: true, ...pageInfo });
+        } catch (e) {
+          try { await cdpDetach(tabId); } catch(_) {}
+          await reportResult(cmd.taskId, { ok: false, error: e.message });
+        }
+        break;
+      }
+
+      // ── CDP step executor (no content script needed) ──────────────
+      case 'automate-cdp': {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tabId = tabs[0]?.id;
+        if (!tabId) { await reportResult(cmd.taskId, { ok: false, error: 'no active tab' }); break; }
+
+        const results = [];
+        try {
+          await cdpAttach(tabId);
+
+          for (const step of cmd.steps || []) {
+            try {
+              switch (step.action) {
+
+                case 'click': {
+                  await clickSel(tabId, step.selector, step.timeout || 8000);
+                  results.push({ step: 'click', selector: step.selector, ok: true });
+                  await sleep(300);
+                  break;
+                }
+
+                case 'click-text': {
+                  const coord = await evaluate(tabId, `
+                    (function(){
+                      const needle = ${JSON.stringify((step.text || '').toLowerCase())};
+                      const candidates = [...document.querySelectorAll(
+                        'button,[role="button"],a,[role="link"],span,div,li,td,th,label,summary'
+                      )];
+                      // Sort by how closely the element's own text matches the needle
+                      const scored = candidates
+                        .map(el => {
+                          const t = (el.textContent || '').trim().toLowerCase();
+                          if (!t.includes(needle)) return null;
+                          const r = el.getBoundingClientRect();
+                          if (!r.width || !r.height) return null;
+                          return { el, score: t.length - needle.length, r };
+                        })
+                        .filter(Boolean)
+                        .sort((a,b) => a.score - b.score);
+                      if (!scored.length) return null;
+                      const { r } = scored[0];
+                      return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+                    })()
+                  `);
+                  if (coord) {
+                    await cdpClick(tabId, coord.x, coord.y);
+                    results.push({ step: 'click-text', text: step.text, ok: true });
+                  } else {
+                    results.push({ step: 'click-text', text: step.text, ok: false, error: 'not found' });
+                  }
+                  await sleep(300);
+                  break;
+                }
+
+                case 'type': {
+                  if (step.selector) {
+                    await clickSel(tabId, step.selector, step.timeout || 8000);
+                    await sleep(200);
+                  }
+                  if (step.clear) await cdpClear(tabId);
+                  await cdpType(tabId, step.text || '');
+                  results.push({ step: 'type', ok: true });
+                  break;
+                }
+
+                case 'press': {
+                  await cdpKey(tabId, step.key);
+                  results.push({ step: 'press', key: step.key, ok: true });
+                  await sleep(200);
+                  break;
+                }
+
+                case 'wait': {
+                  await waitForRect(tabId, step.selector, step.timeout || 8000);
+                  results.push({ step: 'wait', selector: step.selector, ok: true });
+                  break;
+                }
+
+                case 'scroll': {
+                  await evaluate(tabId, `window.scrollBy(0, ${Number(step.amount) || 400})`);
+                  results.push({ step: 'scroll', ok: true });
+                  await sleep(300);
+                  break;
+                }
+
+                case 'sleep': {
+                  await sleep(Number(step.ms) || 1000);
+                  results.push({ step: 'sleep', ok: true });
+                  break;
+                }
+
+                case 'navigate': {
+                  await chrome.tabs.update(tabId, { url: step.url });
+                  await waitForTabLoad(tabId);
+                  await sleep(2000);
+                  // Re-attach after navigation
+                  attachedTabs.delete(tabId);
+                  await cdpAttach(tabId);
+                  results.push({ step: 'navigate', url: step.url, ok: true });
+                  break;
+                }
+
+                default:
+                  results.push({ step: step.action, ok: false, error: 'unknown step action' });
+              }
+            } catch (stepErr) {
+              console.warn('[CDP-AUTOMATE] step failed:', step.action, stepErr.message);
+              results.push({ step: step.action, ok: false, error: stepErr.message });
+              // Continue to next step unless marked required
+              if (step.required === true) break;
+            }
+          }
+
+          await cdpDetach(tabId);
+          await reportResult(cmd.taskId, { ok: true, results });
+        } catch (e) {
+          try { await cdpDetach(tabId); } catch(_) {}
+          console.error('[CDP-AUTOMATE] fatal:', e.message);
+          await reportResult(cmd.taskId, { ok: false, error: e.message, results });
+        }
         break;
       }
 

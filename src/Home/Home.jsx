@@ -69,6 +69,7 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
   const [drawer,     setDrawer]     = useState(false);
   const [focused,    setFocused]    = useState(false);
   const [typing,     setTyping]     = useState(false);
+  const [screenMode, setScreenMode] = useState(false);
   const bottomRef = useRef(null);
   const conversationRef = useRef([]);
   const conversationIdRef = useRef(null);
@@ -161,8 +162,20 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
       // Fetch memory context before sending to AI
       const memoryContext = await fetchMemoryContext(userId, text);
 
-      // Call Gemini API with memory context
-      const rawBotText = await sendMessageToAI(conversationRef.current, memoryContext);
+      // Capture screen if screen-aware mode is on (via main process — desktopCapturer is main-only in Electron 20+)
+      let screenshot = null;
+      if (screenMode && ipcRenderer) {
+        try {
+          const result = await ipcRenderer.invoke('screen:capture');
+          if (result.ok) screenshot = { base64: result.base64, mimeType: result.mimeType };
+          else console.warn('[SCREEN] capture returned error:', result.error);
+        } catch (e) {
+          console.warn('[SCREEN] capture failed:', e.message);
+        }
+      }
+
+      // Call Gemini API with memory context (+ optional screenshot)
+      const rawBotText = await sendMessageToAI(conversationRef.current, memoryContext, null, screenshot);
 
       // Parse + execute any <action>...</action> blocks the AI emitted.
       // This strips the tags from what the user sees and dispatches each
@@ -521,7 +534,7 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
                 transition={{ duration: 0.18 }}
                 style={{ margin: "0 0 8px", fontFamily: MONO, fontSize: 9, color: DIM, letterSpacing: "1.5px" }}
               >
-                enter ↵ to send
+                enter ↵ to send{screenMode ? <span style={{ color: CORAL, marginLeft: 10 }}>· screen on</span> : null}
               </motion.p>
             )}
           </AnimatePresence>
@@ -532,6 +545,24 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
               transition={{ duration: 0.22 }}
               style={{ fontFamily: MONO, fontSize: 15, flexShrink: 0, paddingBottom: 10, lineHeight: 1 }}
             >›</motion.span>
+
+            {/* Screen-aware toggle */}
+            <motion.button
+              onClick={() => setScreenMode(m => !m)}
+              whileTap={{ scale: 0.88 }}
+              title={screenMode ? 'screen context: on (click to turn off)' : 'screen context: off (click to let thera see your screen)'}
+              animate={{ opacity: screenMode ? 1 : 0.3, color: screenMode ? CORAL : DIM }}
+              transition={{ duration: 0.2 }}
+              style={{ background: 'transparent', border: 'none', cursor: 'pointer', flexShrink: 0, paddingBottom: 10, fontSize: 14, lineHeight: 1, position: 'relative' }}
+            >
+              👁
+              {screenMode && (
+                <motion.span
+                  initial={{ scale: 0 }} animate={{ scale: 1 }}
+                  style={{ position: 'absolute', top: 0, right: -1, width: 5, height: 5, borderRadius: '50%', background: CORAL, boxShadow: `0 0 5px ${CORAL}`, display: 'block' }}
+                />
+              )}
+            </motion.button>
 
             <div style={{ flex: 1, position: "relative" }}>
               <input

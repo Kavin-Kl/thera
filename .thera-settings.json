@@ -1,5 +1,5 @@
 {
-  "nsfwMode": true,
+  "nsfwMode": false,
   "onboardingData": {
     "vibe_check": "it's actually okay today, weirdly",
     "want_from_app": [
@@ -16,5 +16,49 @@
     ],
     "name": "Nithin"
   },
-  "onboardingCompleted": true
+  "onboardingCompleted": true,
+  "onboardingCompleted_desktop_user": true,
+  "onboardingData_desktop_user": {
+    "vibe_check": "like a browser with 47 tabs open",
+    "want_from_app": [
+      "honestly just company"
+    ],
+    "nsfw_mode": "on — let thera speak freely",
+    "age_group": "18–24",
+    "coping": [
+      "i talk to people (shocking, i know)",
+      "i bottle it up until i implode",
+      "humour. dark humour. very dark humour."
+    ],
+    "tone": "be honest, even if it stings a bit",
+    "struggles": [
+      "anxiety that won't shut up",
+      "depression or just... flatness",
+      "loneliness, even around people"
+    ],
+    "name": "Kavin"
+  },
+  "onboardingCompleted_5b6a1f8d-1164-4f20-9b6c-04779953856a": true,
+  "onboardingData_5b6a1f8d-1164-4f20-9b6c-04779953856a": {
+    "vibe_check": "like a browser with 47 tabs open",
+    "want_from_app": [
+      "someone to vent to at 2am",
+      "help organising the chaos in my head",
+      "a perspective that isn't mine for once"
+    ],
+    "nsfw_mode": "on — let thera speak freely",
+    "age_group": "18–24",
+    "coping": [
+      "i talk to people (shocking, i know)",
+      "i bottle it up until i implode",
+      "humour. dark humour. very dark humour."
+    ],
+    "tone": "be honest, even if it stings a bit",
+    "struggles": [
+      "depression or just... flatness",
+      "loneliness, even around people",
+      "anxiety that won't shut up"
+    ],
+    "name": "Kavin"
+  }
 }

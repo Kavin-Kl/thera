@@ -197,6 +197,24 @@ available types (exactly these, no others):
 - browser.search { query, engine? }   ← engine: google/youtube/maps/amazon/zomato/bookmyshow
 - browser.whatsapp.dm { to, message }
 - browser.instagram.dm { to, message }
+- browser.ai_task { goal, url? }  ← FULL autonomous browser control. thera opens the browser, looks at what's on screen, and figures out exactly what to click/type/do to complete the goal. use this for: booking tickets, playing youtube videos, filling forms, buying things, searching anything, navigating any website. url is optional starting point.
+
+SCREEN CONTEXT — screenshot is attached:
+
+READ THE ACTUAL TEXT ON SCREEN. do not wing it.
+
+if they ask "what should i reply" / "what do i say" / "help me reply" / "how do i respond":
+→ output ONLY the reply text. the exact words to send. nothing before. nothing after.
+→ READ what the other person actually said. quote it mentally. reply to THAT specific thing.
+→ match their energy: casual → casual. dry humour → dry humour. rude → sharp. emotional → real.
+→ NEVER give generic filler like "sounds good" "definitely" "that's interesting" — that's useless. you read the screen. use what's there.
+→ if it's a question: answer it with actual content based on context.
+→ if it's passive-aggressive: one line that holds ground without being defensive.
+→ if it's venting: validate the specific thing they complained about.
+→ if it's drama: give them the reply that ends it cleanly or opens the door.
+→ one to two lines MAX. punchy. sounds like a real person typed it at 2am, not a bot.
+
+for everything else with a screenshot: use the context. don't describe what you see. just help.
 
 rules:
 - your prose reply comes first, then the tag(s), nothing after.
@@ -214,15 +232,29 @@ function Widget() {
   const [typing,         setTyping]         = useState(false);
   const [mounted,        setMounted]        = useState(false);
   // Widget is hidden while the main chat window is open
-  const [widgetVisible,  setWidgetVisible]  = useState(false);
+  const [widgetVisible,  setWidgetVisible]  = useState(true);
   const [pressing,       setPressing]       = useState(false);
   const [pillDims,       setPillDims]       = useState(null);
   const [nsfwMode,       setNsfwMode]       = useState(false);
+  const [screenMode,     setScreenMode]     = useState(false);
   const [dragging,       setDragging]       = useState(false);
   const [nowPlaying,     setNowPlaying]     = useState(null); // { track, artist, isPlaying }
   const [spotifyLoading, setSpotifyLoading] = useState(null); // 'prev'|'toggle'|'next'
 
   const nowPlayingPollRef = useRef(null);
+
+  // ── Keep widget interactive whenever mini chat is open ────────
+  // Without this, browser automation taking focus would leave the
+  // widget click-through even after the task completes.
+  useEffect(() => {
+    if (!ipcRenderer) return;
+    if (miniChat) {
+      try { ipcRenderer.send('set-widget-interactive', true); } catch (_) {}
+      return () => {
+        try { ipcRenderer.send('set-widget-interactive', false); } catch (_) {}
+      };
+    }
+  }, [miniChat]);
 
   const dismissTimer   = useRef(null);
   const pressTimer     = useRef(null);
@@ -407,9 +439,21 @@ function Widget() {
     ];
 
     try {
+      // Capture screen if screen mode is on (via main process — desktopCapturer is main-only in Electron 20+)
+      let screenshot = null;
+      if (screenMode && ipcRenderer) {
+        try {
+          const result = await ipcRenderer.invoke('screen:capture');
+          if (result.ok) screenshot = { base64: result.base64, mimeType: result.mimeType };
+          else console.warn('[SCREEN] widget capture returned error:', result.error);
+        } catch (e) {
+          console.warn('[SCREEN] widget capture failed:', e.message);
+        }
+      }
+
       // Use a trimmed history (last 6 turns) with mini system prompt
       const trimmed = miniHistory.current.slice(-6);
-      const rawBotText = await sendMessageToAI(trimmed, '', MINI_PROMPT);
+      const rawBotText = await sendMessageToAI(trimmed, '', MINI_PROMPT, screenshot);
 
       // Strip + execute any <action>...</action> tags the AI emitted.
       const { displayText, results, resultSummary } = await processAIResponse(rawBotText);
@@ -561,6 +605,24 @@ function Widget() {
                     }}>
                       hold for chat
                     </span>
+
+                    <AnimatePresence>
+                      {screenMode && (
+                        <motion.span
+                          key="eye-pill"
+                          initial={{ opacity: 0, scale: 0.6 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          exit={{ opacity: 0, scale: 0.6 }}
+                          transition={{ duration: 0.18 }}
+                          title="screen context on"
+                          style={{
+                            fontSize: 9, lineHeight: 1,
+                            color: CORAL,
+                            filter: `drop-shadow(0 0 3px ${CORAL})`,
+                          }}
+                        >👁</motion.span>
+                      )}
+                    </AnimatePresence>
                   </motion.div>
                 )}
 
@@ -698,9 +760,6 @@ function Widget() {
             onMouseEnter={() => {
               try { ipcRenderer?.send('set-widget-interactive', true); } catch (_) {}
             }}
-            onMouseLeave={() => {
-              try { ipcRenderer?.send('set-widget-interactive', false); } catch (_) {}
-            }}
             style={{
               pointerEvents: 'auto',
               marginTop: 6,
@@ -776,6 +835,30 @@ function Widget() {
                   </span>
                 </motion.button>
 
+                {/* Screen-aware toggle */}
+                <motion.button
+                  onClick={(e) => { e.stopPropagation(); setScreenMode(m => !m); }}
+                  onMouseDown={e => e.stopPropagation()}
+                  whileTap={{ scale: 0.88 }}
+                  title={screenMode ? 'screen context on — thera can see your screen. click to turn off.' : 'screen context off — click to let thera see your screen.'}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 3,
+                    background: screenMode ? 'rgba(232,96,58,0.12)' : 'rgba(255,255,255,0.04)',
+                    border: `0.5px solid ${screenMode ? 'rgba(232,96,58,0.35)' : 'rgba(255,255,255,0.1)'}`,
+                    borderRadius: 20, padding: '2px 7px 2px 5px',
+                    cursor: 'pointer', transition: 'all 0.2s',
+                  }}
+                >
+                  <span style={{ fontSize: 10, lineHeight: 1, opacity: screenMode ? 1 : 0.45 }}>👁</span>
+                  <span style={{
+                    fontFamily: MONO, fontSize: 7.5, letterSpacing: '0.8px',
+                    color: screenMode ? CORAL : 'rgba(255,255,255,0.25)',
+                    transition: 'color 0.2s', textTransform: 'uppercase',
+                  }}>
+                    {screenMode ? 'on' : 'off'}
+                  </span>
+                </motion.button>
+
                 <motion.button
                   onClick={() => setMiniChat(false)}
                   onMouseDown={e => e.stopPropagation()}
@@ -842,6 +925,20 @@ function Widget() {
                 transition={{ duration: 0.2 }}
                 style={{ fontFamily: MONO, fontSize: 13, flexShrink: 0, lineHeight: 1 }}
               >›</motion.span>
+
+              <AnimatePresence>
+                {screenMode && (
+                  <motion.span
+                    key="eye-input"
+                    initial={{ opacity: 0, width: 0 }}
+                    animate={{ opacity: 1, width: 'auto' }}
+                    exit={{ opacity: 0, width: 0 }}
+                    transition={{ duration: 0.15 }}
+                    style={{ fontSize: 10, lineHeight: 1, color: CORAL, flexShrink: 0 }}
+                    title="screen context on"
+                  >👁</motion.span>
+                )}
+              </AnimatePresence>
 
               <input
                 ref={inputRef}
