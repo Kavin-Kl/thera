@@ -32,6 +32,7 @@ let mainWindow;
 let widgetWindow;
 let tray;
 let store;
+let closingAnimation = false; // prevents blur handler from hiding window mid-animation
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -40,7 +41,8 @@ function createWindow() {
     minWidth: 350,
     minHeight: 500,
     frame: false,
-    backgroundColor: '#18120a',
+    transparent: true,
+    hasShadow: true,
     skipTaskbar: false,
     alwaysOnTop: false,
     webPreferences: {
@@ -65,18 +67,28 @@ function createWindow() {
     }
   });
 
-  // Show window on restore
+  // When main window becomes visible → hide widget
   mainWindow.on('show', () => {
-    // setHighlightMode is macOS-only
-    if (process.platform === 'darwin' && tray.setHighlightMode) {
+    if (process.platform === 'darwin' && tray && tray.setHighlightMode) {
       tray.setHighlightMode('always');
+    }
+    if (widgetWindow && !widgetWindow.isDestroyed()) {
+      widgetWindow.webContents.send('widget-visibility', false);
     }
   });
 
-  // Auto-hide when user clicks away
+  // When main window is hidden → show widget
+  mainWindow.on('hide', () => {
+    if (widgetWindow && !widgetWindow.isDestroyed()) {
+      widgetWindow.webContents.send('widget-visibility', true);
+    }
+  });
+
+  // Auto-hide when user clicks away (not during close animation)
   mainWindow.on('blur', () => {
+    if (closingAnimation) return;
     setTimeout(() => {
-      if (!mainWindow.isFocused() && mainWindow.isVisible()) {
+      if (!closingAnimation && !mainWindow.isFocused() && mainWindow.isVisible()) {
         mainWindow.hide();
       }
     }, 200);
@@ -123,13 +135,9 @@ function createWidgetWindow() {
 
   console.log('[WIDGET] Widget window created at position:', savedPosition);
 
-  // On Windows: forward mouse events through transparent areas, but keep pill/chat interactive
-  // On macOS: the React pointerEvents CSS handles this correctly
-  if (process.platform === 'win32') {
-    widgetWindow.setIgnoreMouseEvents(true, { forward: true });
-  } else {
-    widgetWindow.setIgnoreMouseEvents(false);
-  }
+  // Transparent areas pass clicks through to whatever is underneath.
+  // The React side sends 'set-widget-interactive' on mouseenter/leave to toggle this.
+  widgetWindow.setIgnoreMouseEvents(true, { forward: true });
 
   // Debug: Log window events
   widgetWindow.on('closed', () => {
@@ -158,17 +166,21 @@ function createWidgetWindow() {
 function createTray() {
   const { nativeImage } = require('electron');
 
-  const trayIcon = nativeImage.createFromPath(path.join(__dirname, '..', 'thera.png'));
+  const iconSize = process.platform === 'darwin' ? 16 : 24;
+  const trayIcon = nativeImage
+    .createFromPath(path.join(__dirname, '..', 'thera.png'))
+    .resize({ width: iconSize, height: iconSize });
+
+  if (process.platform === 'darwin') {
+    trayIcon.setTemplateImage(true);
+  }
 
   tray = new Tray(trayIcon);
 
   const contextMenu = Menu.buildFromTemplate([
     {
       label: 'Show Thera',
-      click: () => {
-        mainWindow.show();
-        mainWindow.focus();
-      }
+      click: () => expandFromPill(),
     },
     {
       label: 'Hide Thera',
@@ -192,10 +204,9 @@ function createTray() {
   // Click tray icon to show/hide
   tray.on('click', () => {
     if (mainWindow.isVisible()) {
-      mainWindow.hide();
+      ipcMain.emit('close-window'); // use the animated close
     } else {
-      mainWindow.show();
-      mainWindow.focus();
+      expandFromPill();
     }
   });
 }
@@ -205,13 +216,148 @@ ipcMain.on('minimize-window', () => {
   if (mainWindow) mainWindow.minimize();
 });
 
+/* ── Pill geometry (shared by both animations) ──────────── */
+const PILL_W = 180, PILL_H = 36;
+
+function getPillBounds() {
+  if (widgetWindow && !widgetWindow.isDestroyed()) {
+    const [wx, wy] = widgetWindow.getPosition();
+    const [ww]     = widgetWindow.getSize();
+    return {
+      x: wx + Math.round((ww - PILL_W) / 2),
+      y: wy + 8,
+      w: PILL_W,
+      h: PILL_H,
+    };
+  }
+  return { x: 0, y: 0, w: PILL_W, h: PILL_H };
+}
+
+function getCenteredBounds() {
+  const { screen } = require('electron');
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+  const W = 900, H = 627;
+  return { x: Math.round((width - W) / 2), y: Math.round((height - H) / 2), w: W, h: H };
+}
+
+/* ── CLOSE: main window flies into the pill ─────────────── */
 ipcMain.on('close-window', () => {
-  if (mainWindow) mainWindow.hide();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  mainWindow.webContents.send('start-close-animation');
+
+  const [startX, startY] = mainWindow.getPosition();
+  const [startW, startH] = mainWindow.getSize();
+  const pill = getPillBounds();
+
+  mainWindow.setMinimumSize(1, 1);
+  closingAnimation = true;
+
+  const DURATION = 350, FPS = 60, FRAME_MS = 1000 / FPS;
+  const FRAMES = Math.round(DURATION / FRAME_MS);
+  let frame = 0, widgetShown = false;
+
+  const tick = setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) { clearInterval(tick); return; }
+
+    frame++;
+    const t    = Math.min(frame / FRAMES, 1);
+    const ease = t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
+
+    mainWindow.setPosition(
+      Math.round(startX + (pill.x - startX) * ease),
+      Math.round(startY + (pill.y - startY) * ease),
+    );
+    mainWindow.setSize(
+      Math.max(Math.round(startW + (pill.w - startW) * ease), 1),
+      Math.max(Math.round(startH + (pill.h - startH) * ease), 1),
+    );
+
+    // Fade out window opacity (including shadow) in the last 35%
+    mainWindow.setOpacity(t >= 0.65 ? Math.max(0, 1 - (t - 0.65) / 0.35) : 1);
+
+    // Show widget at 50% — alwaysOnTop covers the fading window
+    if (!widgetShown && t >= 0.50) {
+      widgetShown = true;
+      if (widgetWindow && !widgetWindow.isDestroyed()) {
+        widgetWindow.webContents.send('widget-visibility', true);
+      }
+    }
+
+    if (t >= 1) {
+      clearInterval(tick);
+      setTimeout(() => {
+        closingAnimation = false;
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.hide();
+          mainWindow.setOpacity(1);         // restore for next open
+          mainWindow.setMinimumSize(350, 500);
+          mainWindow.setSize(startW, startH);
+          mainWindow.setPosition(startX, startY);
+        }
+      }, 60);
+    }
+  }, FRAME_MS);
 });
 
 ipcMain.on('toggle-always-on-top', (event, alwaysOnTop) => {
   if (mainWindow) mainWindow.setAlwaysOnTop(alwaysOnTop);
 });
+
+/* ── OPEN: pill expands into the main window ─────────────── */
+function expandFromPill() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  const pill    = getPillBounds();
+  const target  = getCenteredBounds();
+
+  // Place window at pill, invisible, then animate outward
+  mainWindow.setMinimumSize(1, 1);
+  mainWindow.setSize(pill.w, pill.h);
+  mainWindow.setPosition(pill.x, pill.y);
+  mainWindow.setOpacity(0);
+  mainWindow.showInactive(); // show without stealing focus yet
+
+  // Hide widget immediately — window will expand over its position
+  if (widgetWindow && !widgetWindow.isDestroyed()) {
+    widgetWindow.webContents.send('widget-visibility', false);
+  }
+
+  mainWindow.webContents.send('start-open-animation');
+
+  const DURATION = 350, FPS = 60, FRAME_MS = 1000 / FPS;
+  const FRAMES = Math.round(DURATION / FRAME_MS);
+  let frame = 0;
+
+  const tick = setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) { clearInterval(tick); return; }
+
+    frame++;
+    const t    = Math.min(frame / FRAMES, 1);
+    const ease = t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
+
+    mainWindow.setPosition(
+      Math.round(pill.x + (target.x - pill.x) * ease),
+      Math.round(pill.y + (target.y - pill.y) * ease),
+    );
+    mainWindow.setSize(
+      Math.max(Math.round(pill.w + (target.w - pill.w) * ease), 1),
+      Math.max(Math.round(pill.h + (target.h - pill.h) * ease), 1),
+    );
+
+    // Fade window in during first 35%
+    mainWindow.setOpacity(t <= 0.35 ? t / 0.35 : 1);
+
+    if (t >= 1) {
+      clearInterval(tick);
+      mainWindow.setOpacity(1);
+      mainWindow.setMinimumSize(350, 500);
+      mainWindow.setSize(target.w, target.h);
+      mainWindow.setPosition(target.x, target.y);
+      mainWindow.focus();
+    }
+  }, FRAME_MS);
+}
 
 // Widget interaction handlers
 ipcMain.on('widget-clicked', () => {
@@ -219,7 +365,7 @@ ipcMain.on('widget-clicked', () => {
 });
 
 ipcMain.on('widget-long-press', () => {
-  if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+  expandFromPill();
 });
 
 // Drag: move widget window to absolute screen position
@@ -244,14 +390,13 @@ ipcMain.on('widget-resize', (_e, { height }) => {
   }
 });
 
-// Enable/disable mouse event forwarding (for Windows drag fix)
+// Mouse over pill → capture events; mouse out → pass through to desktop
 ipcMain.on('set-widget-interactive', (_e, interactive) => {
-  if (widgetWindow && process.platform === 'win32') {
-    if (interactive) {
-      widgetWindow.setIgnoreMouseEvents(false);
-    } else {
-      widgetWindow.setIgnoreMouseEvents(true, { forward: true });
-    }
+  if (!widgetWindow || widgetWindow.isDestroyed()) return;
+  if (interactive) {
+    widgetWindow.setIgnoreMouseEvents(false);
+  } else {
+    widgetWindow.setIgnoreMouseEvents(true, { forward: true });
   }
 });
 

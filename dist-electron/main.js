@@ -2252,12 +2252,28 @@ var require_activityMonitor = /* @__PURE__ */ __commonJSMin(((exports, module) =
 		if (a.includes("chrome") || a.includes("firefox") || a.includes("safari") || a.includes("edge") || a.includes("brave")) return "browsing";
 		return "other";
 	}
+	function getEmotion(type, metadata) {
+		if (type === "social-quick") return "concerned";
+		if (type === "intelligent") {
+			const types = (metadata && metadata.patterns || []).map((p) => (p.type || "").toLowerCase());
+			if (types.some((t) => t.includes("doom") || t.includes("social"))) return "concerned";
+			if (types.some((t) => t.includes("late-night") || t.includes("overwork"))) return "stressed";
+			if (types.some((t) => t.includes("stuck"))) return "sad";
+			if (metadata && metadata.spotifyLoop) return "content";
+			return "neutral";
+		}
+		return "neutral";
+	}
 	function sendNudge(type, message, metadata = {}) {
-		console.log(`[NUDGE] ${type}: "${message}"`);
+		const emotion = getEmotion(type, metadata);
+		console.log(`[NUDGE] ${type} (${emotion}): "${message}"`);
 		if (metadata.reasoning) console.log(`[NUDGE] Reasoning: ${metadata.reasoning}`);
 		nudgeOps.recordNudge(type, message);
 		const widget = BrowserWindow$1.getAllWindows().find((w) => w.isAlwaysOnTop() && !w.frame);
-		if (widget) widget.webContents.send("show-nudge", message);
+		if (widget) widget.webContents.send("show-nudge", {
+			text: message,
+			emotion
+		});
 		else console.warn("[NUDGE] No widget window found");
 	}
 	async function checkIntelligentNudges() {
@@ -2492,6 +2508,7 @@ var actions = require_actions();
 var mainWindow;
 var widgetWindow;
 var tray;
+var closingAnimation = false;
 function createWindow() {
 	mainWindow = new BrowserWindow({
 		width: 900,
@@ -2499,7 +2516,8 @@ function createWindow() {
 		minWidth: 350,
 		minHeight: 500,
 		frame: false,
-		backgroundColor: "#18120a",
+		transparent: true,
+		hasShadow: true,
 		skipTaskbar: false,
 		alwaysOnTop: false,
 		webPreferences: {
@@ -2516,11 +2534,16 @@ function createWindow() {
 		}
 	});
 	mainWindow.on("show", () => {
-		if (process.platform === "darwin" && tray.setHighlightMode) tray.setHighlightMode("always");
+		if (process.platform === "darwin" && tray && tray.setHighlightMode) tray.setHighlightMode("always");
+		if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.webContents.send("widget-visibility", false);
+	});
+	mainWindow.on("hide", () => {
+		if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.webContents.send("widget-visibility", true);
 	});
 	mainWindow.on("blur", () => {
+		if (closingAnimation) return;
 		setTimeout(() => {
-			if (!mainWindow.isFocused() && mainWindow.isVisible()) mainWindow.hide();
+			if (!closingAnimation && !mainWindow.isFocused() && mainWindow.isVisible()) mainWindow.hide();
 		}, 200);
 	});
 }
@@ -2553,8 +2576,7 @@ function createWidgetWindow() {
 		widgetWindow.loadURL(`${baseURL}/widget.html`);
 	} else widgetWindow.loadFile(path.join(__dirname, "../dist/widget.html"));
 	console.log("[WIDGET] Widget window created at position:", savedPosition);
-	if (process.platform === "win32") widgetWindow.setIgnoreMouseEvents(true, { forward: true });
-	else widgetWindow.setIgnoreMouseEvents(false);
+	widgetWindow.setIgnoreMouseEvents(true, { forward: true });
 	widgetWindow.on("closed", () => {
 		console.log("[WIDGET] Widget window closed");
 	});
@@ -2573,14 +2595,17 @@ function createWidgetWindow() {
 }
 function createTray() {
 	const { nativeImage } = require("electron");
-	tray = new Tray(nativeImage.createFromPath(path.join(__dirname, "..", "thera.png")));
+	const iconSize = process.platform === "darwin" ? 16 : 24;
+	const trayIcon = nativeImage.createFromPath(path.join(__dirname, "..", "thera.png")).resize({
+		width: iconSize,
+		height: iconSize
+	});
+	if (process.platform === "darwin") trayIcon.setTemplateImage(true);
+	tray = new Tray(trayIcon);
 	const contextMenu = Menu.buildFromTemplate([
 		{
 			label: "Show Thera",
-			click: () => {
-				mainWindow.show();
-				mainWindow.focus();
-			}
+			click: () => expandFromPill()
 		},
 		{
 			label: "Hide Thera",
@@ -2600,30 +2625,127 @@ function createTray() {
 	tray.setToolTip("Thera - Your desktop companion");
 	tray.setContextMenu(contextMenu);
 	tray.on("click", () => {
-		if (mainWindow.isVisible()) mainWindow.hide();
-		else {
-			mainWindow.show();
-			mainWindow.focus();
-		}
+		if (mainWindow.isVisible()) ipcMain.emit("close-window");
+		else expandFromPill();
 	});
 }
 ipcMain.on("minimize-window", () => {
 	if (mainWindow) mainWindow.minimize();
 });
+var PILL_W = 180, PILL_H = 36;
+function getPillBounds() {
+	if (widgetWindow && !widgetWindow.isDestroyed()) {
+		const [wx, wy] = widgetWindow.getPosition();
+		const [ww] = widgetWindow.getSize();
+		return {
+			x: wx + Math.round((ww - PILL_W) / 2),
+			y: wy + 8,
+			w: PILL_W,
+			h: PILL_H
+		};
+	}
+	return {
+		x: 0,
+		y: 0,
+		w: PILL_W,
+		h: PILL_H
+	};
+}
+function getCenteredBounds() {
+	const { screen } = require("electron");
+	const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+	const W = 900, H = 627;
+	return {
+		x: Math.round((width - W) / 2),
+		y: Math.round((height - H) / 2),
+		w: W,
+		h: H
+	};
+}
 ipcMain.on("close-window", () => {
-	if (mainWindow) mainWindow.hide();
+	if (!mainWindow || mainWindow.isDestroyed()) return;
+	mainWindow.webContents.send("start-close-animation");
+	const [startX, startY] = mainWindow.getPosition();
+	const [startW, startH] = mainWindow.getSize();
+	const pill = getPillBounds();
+	mainWindow.setMinimumSize(1, 1);
+	closingAnimation = true;
+	const DURATION = 350, FRAME_MS = 1e3 / 60;
+	const FRAMES = Math.round(DURATION / FRAME_MS);
+	let frame = 0, widgetShown = false;
+	const tick = setInterval(() => {
+		if (!mainWindow || mainWindow.isDestroyed()) {
+			clearInterval(tick);
+			return;
+		}
+		frame++;
+		const t = Math.min(frame / FRAMES, 1);
+		const ease = t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+		mainWindow.setPosition(Math.round(startX + (pill.x - startX) * ease), Math.round(startY + (pill.y - startY) * ease));
+		mainWindow.setSize(Math.max(Math.round(startW + (pill.w - startW) * ease), 1), Math.max(Math.round(startH + (pill.h - startH) * ease), 1));
+		mainWindow.setOpacity(t >= .65 ? Math.max(0, 1 - (t - .65) / .35) : 1);
+		if (!widgetShown && t >= .5) {
+			widgetShown = true;
+			if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.webContents.send("widget-visibility", true);
+		}
+		if (t >= 1) {
+			clearInterval(tick);
+			setTimeout(() => {
+				closingAnimation = false;
+				if (mainWindow && !mainWindow.isDestroyed()) {
+					mainWindow.hide();
+					mainWindow.setOpacity(1);
+					mainWindow.setMinimumSize(350, 500);
+					mainWindow.setSize(startW, startH);
+					mainWindow.setPosition(startX, startY);
+				}
+			}, 60);
+		}
+	}, FRAME_MS);
 });
 ipcMain.on("toggle-always-on-top", (event, alwaysOnTop) => {
 	if (mainWindow) mainWindow.setAlwaysOnTop(alwaysOnTop);
 });
+function expandFromPill() {
+	if (!mainWindow || mainWindow.isDestroyed()) return;
+	const pill = getPillBounds();
+	const target = getCenteredBounds();
+	mainWindow.setMinimumSize(1, 1);
+	mainWindow.setSize(pill.w, pill.h);
+	mainWindow.setPosition(pill.x, pill.y);
+	mainWindow.setOpacity(0);
+	mainWindow.showInactive();
+	if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.webContents.send("widget-visibility", false);
+	mainWindow.webContents.send("start-open-animation");
+	const DURATION = 350, FRAME_MS = 1e3 / 60;
+	const FRAMES = Math.round(DURATION / FRAME_MS);
+	let frame = 0;
+	const tick = setInterval(() => {
+		if (!mainWindow || mainWindow.isDestroyed()) {
+			clearInterval(tick);
+			return;
+		}
+		frame++;
+		const t = Math.min(frame / FRAMES, 1);
+		const ease = t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+		mainWindow.setPosition(Math.round(pill.x + (target.x - pill.x) * ease), Math.round(pill.y + (target.y - pill.y) * ease));
+		mainWindow.setSize(Math.max(Math.round(pill.w + (target.w - pill.w) * ease), 1), Math.max(Math.round(pill.h + (target.h - pill.h) * ease), 1));
+		mainWindow.setOpacity(t <= .35 ? t / .35 : 1);
+		if (t >= 1) {
+			clearInterval(tick);
+			mainWindow.setOpacity(1);
+			mainWindow.setMinimumSize(350, 500);
+			mainWindow.setSize(target.w, target.h);
+			mainWindow.setPosition(target.x, target.y);
+			mainWindow.focus();
+		}
+	}, FRAME_MS);
+}
 ipcMain.on("widget-clicked", () => {
 	if (widgetWindow) widgetWindow.webContents.send("dismiss-nudge");
 });
 ipcMain.on("widget-long-press", () => {
-	if (mainWindow) {
-		mainWindow.show();
-		mainWindow.focus();
-	}
+	expandFromPill();
 });
 ipcMain.on("move-widget", (_e, { x, y }) => {
 	if (widgetWindow) widgetWindow.setPosition(Math.round(x), Math.round(y));
@@ -2648,7 +2770,8 @@ ipcMain.on("widget-resize", (_e, { height }) => {
 	}
 });
 ipcMain.on("set-widget-interactive", (_e, interactive) => {
-	if (widgetWindow && process.platform === "win32") if (interactive) widgetWindow.setIgnoreMouseEvents(false);
+	if (!widgetWindow || widgetWindow.isDestroyed()) return;
+	if (interactive) widgetWindow.setIgnoreMouseEvents(false);
 	else widgetWindow.setIgnoreMouseEvents(true, { forward: true });
 });
 ipcMain.handle("get-setting", (_e, key) => settings.get(key));

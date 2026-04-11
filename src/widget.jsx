@@ -31,6 +31,85 @@ function TypingDots() {
   );
 }
 
+/* ── Mood face SVG (no border, just features) ────────────── */
+function MoodFace({ emotion = 'neutral' }) {
+  const eye  = "rgba(255,255,255,0.7)";
+  const mouth = "rgba(255,255,255,0.58)";
+  const brow  = "rgba(255,255,255,0.38)";
+  const sw = 1.25;
+
+  const faces = {
+    // —— flat dash eyes, flat mouth
+    neutral: <>
+      <line x1="6.5" y1="9" x2="9.5" y2="9"   stroke={eye}   strokeWidth={sw} strokeLinecap="round"/>
+      <line x1="12.5" y1="9" x2="15.5" y2="9"  stroke={eye}   strokeWidth={sw} strokeLinecap="round"/>
+      <line x1="8"   y1="14.5" x2="14" y2="14.5" stroke={mouth} strokeWidth={sw} strokeLinecap="round"/>
+    </>,
+    // —— dot eyes, soft smile
+    content: <>
+      <circle cx="8"  cy="9" r="1.15" fill={eye}/>
+      <circle cx="14" cy="9" r="1.15" fill={eye}/>
+      <path d="M8.5 13.5 Q11 15.8 13.5 13.5" stroke={mouth} strokeWidth={sw} strokeLinecap="round" fill="none"/>
+    </>,
+    // —— U-shaped closed eyes, big U smile
+    happy: <>
+      <path d="M6.5 9.5 Q8 11.2 9.5 9.5"   stroke={eye}   strokeWidth={sw} strokeLinecap="round" fill="none"/>
+      <path d="M12.5 9.5 Q14 11.2 15.5 9.5" stroke={eye}   strokeWidth={sw} strokeLinecap="round" fill="none"/>
+      <path d="M7.5 13 Q11 17.2 14.5 13"    stroke={mouth} strokeWidth={sw} strokeLinecap="round" fill="none"/>
+    </>,
+    // —— squinting arch eyes (^), very wide open smile
+    excited: <>
+      <path d="M6.5 10 Q8 7.5 9.5 10"    stroke={eye}   strokeWidth={sw} strokeLinecap="round" fill="none"/>
+      <path d="M12.5 10 Q14 7.5 15.5 10" stroke={eye}   strokeWidth={sw} strokeLinecap="round" fill="none"/>
+      <path d="M7 13 Q11 17.8 15 13"     stroke={mouth} strokeWidth="1.35" strokeLinecap="round" fill="none"/>
+    </>,
+    // —— dot eyes, slight frown
+    concerned: <>
+      <circle cx="8"  cy="9" r="1.15" fill={eye}/>
+      <circle cx="14" cy="9" r="1.15" fill={eye}/>
+      <path d="M8.5 15 Q11 13.2 13.5 15" stroke={mouth} strokeWidth={sw} strokeLinecap="round" fill="none"/>
+    </>,
+    // —— dot eyes, worried inner brows, clear frown
+    sad: <>
+      <circle cx="8"  cy="9.5" r="1.15" fill={eye}/>
+      <circle cx="14" cy="9.5" r="1.15" fill={eye}/>
+      <line x1="6.5" y1="7.8" x2="9.5" y2="6.8"  stroke={brow} strokeWidth="1" strokeLinecap="round"/>
+      <line x1="12.5" y1="6.8" x2="15.5" y2="7.8" stroke={brow} strokeWidth="1" strokeLinecap="round"/>
+      <path d="M8.5 15.8 Q11 13.2 13.5 15.8" stroke={mouth} strokeWidth={sw} strokeLinecap="round" fill="none"/>
+    </>,
+    // —— X eyes, wavy tense mouth
+    stressed: <>
+      <line x1="6.5" y1="7.5" x2="9.5" y2="10.5" stroke={eye} strokeWidth={sw} strokeLinecap="round"/>
+      <line x1="9.5" y1="7.5" x2="6.5" y2="10.5" stroke={eye} strokeWidth={sw} strokeLinecap="round"/>
+      <line x1="12.5" y1="7.5" x2="15.5" y2="10.5" stroke={eye} strokeWidth={sw} strokeLinecap="round"/>
+      <line x1="15.5" y1="7.5" x2="12.5" y2="10.5" stroke={eye} strokeWidth={sw} strokeLinecap="round"/>
+      <path d="M8 14.5 Q9.5 13 11 14.5 Q12.5 16 14 14.5" stroke={mouth} strokeWidth="1.1" strokeLinecap="round" fill="none"/>
+    </>,
+    // —— chaotic 爻-style scribble eyes (like user's drawing), open distressed mouth
+    overwhelmed: <>
+      <line x1="6"  y1="7.5" x2="10" y2="11"  stroke={eye} strokeWidth="1.1" strokeLinecap="round"/>
+      <line x1="10" y1="7.5" x2="6"  y2="11"  stroke={eye} strokeWidth="1.1" strokeLinecap="round"/>
+      <line x1="6.5" y1="9.2" x2="9.5" y2="9.2" stroke={eye} strokeWidth="0.8" strokeLinecap="round" opacity="0.55"/>
+      <line x1="12" y1="7.5" x2="16" y2="11"  stroke={eye} strokeWidth="1.1" strokeLinecap="round"/>
+      <line x1="16" y1="7.5" x2="12" y2="11"  stroke={eye} strokeWidth="1.1" strokeLinecap="round"/>
+      <line x1="12.5" y1="9.2" x2="15.5" y2="9.2" stroke={eye} strokeWidth="0.8" strokeLinecap="round" opacity="0.55"/>
+      <path d="M8.5 14.5 Q11 17 13.5 14.5" stroke={mouth} strokeWidth="1.1" strokeLinecap="round" fill="none"/>
+    </>,
+    // —— dot eyes, squiggly uncertain mouth
+    nervous: <>
+      <circle cx="8"  cy="9" r="1.15" fill={eye}/>
+      <circle cx="14" cy="9" r="1.15" fill={eye}/>
+      <path d="M7.5 14.5 Q9 13 10.5 14.5 Q12 16 13.5 14.5 Q14.5 13.5 15 14" stroke={mouth} strokeWidth="1" strokeLinecap="round" fill="none"/>
+    </>,
+  };
+
+  return (
+    <svg width="20" height="20" viewBox="0 0 22 22" fill="none" style={{ display: 'block', flexShrink: 0 }}>
+      {faces[emotion] ?? faces.neutral}
+    </svg>
+  );
+}
+
 /* ── Border-draw overlay (SVG stroke-dashoffset trick) ───── */
 // pathLength="1" normalises the path so dasharray/offset are 0–1 fractions —
 // no need to compute the actual perimeter in JS.
@@ -128,11 +207,14 @@ rules:
 
 function Widget() {
   const [nudgeText,      setNudgeText]      = useState(null);
+  const [nudgeEmotion,   setNudgeEmotion]   = useState('neutral');
   const [miniChat,       setMiniChat]       = useState(false);
   const [input,          setInput]          = useState('');
   const [reply,          setReply]          = useState(null);
   const [typing,         setTyping]         = useState(false);
   const [mounted,        setMounted]        = useState(false);
+  // Widget is hidden while the main chat window is open
+  const [widgetVisible,  setWidgetVisible]  = useState(false);
   const [pressing,       setPressing]       = useState(false);
   const [pillDims,       setPillDims]       = useState(null);
   const [nsfwMode,       setNsfwMode]       = useState(false);
@@ -157,14 +239,24 @@ function Widget() {
     try {
       if (!ipcRenderer) throw new Error('no ipcRenderer');
 
-      ipcRenderer.on('show-nudge', (_e, msg) => {
+      ipcRenderer.on('show-nudge', (_e, data) => {
         if (dismissTimer.current) clearTimeout(dismissTimer.current);
-        setNudgeText(msg);
+        const text    = typeof data === 'string' ? data : data?.text;
+        const emotion = typeof data === 'object'  ? (data?.emotion ?? 'neutral') : 'neutral';
+        setNudgeText(text);
+        setNudgeEmotion(emotion);
         dismissTimer.current = setTimeout(() => setNudgeText(null), 8000);
       });
       ipcRenderer.on('dismiss-nudge', () => {
         if (dismissTimer.current) clearTimeout(dismissTimer.current);
         setNudgeText(null);
+      });
+
+      // Main window visibility → show/hide widget
+      ipcRenderer.on('widget-visibility', (_e, visible) => {
+        setWidgetVisible(!!visible);
+        // Close mini chat when hiding
+        if (!visible) setMiniChat(false);
       });
 
       // Load initial NSFW setting
@@ -178,6 +270,7 @@ function Widget() {
         clearTimeout(pressTimer.current);
         ipcRenderer.removeAllListeners('show-nudge');
         ipcRenderer.removeAllListeners('dismiss-nudge');
+        ipcRenderer.removeAllListeners('widget-visibility');
       };
     } catch (e) {
       return () => clearTimeout(t);
@@ -383,13 +476,13 @@ function Widget() {
     >
 
       <AnimatePresence>
-        {mounted && (
+        {mounted && widgetVisible && (
           <motion.div
             key="pill-wrapper"
-            initial={{ y: -36, opacity: 0, scale: 0.88 }}
-            animate={{ y: 0,   opacity: 1, scale: 1    }}
-            exit={{   y: -36, opacity: 0, scale: 0.88  }}
-            transition={SPRING}
+            initial={{ opacity: 0, scale: 0.6 }}
+            animate={{ opacity: 1, scale: 1   }}
+            exit={{   opacity: 0, scale: 0.7, transition: { duration: 0.15 } }}
+            transition={{ type: 'spring', stiffness: 900, damping: 42, mass: 0.4 }}
             style={{ pointerEvents: 'auto', position: 'relative' }}
           >
             {/* ── BORDER DRAW — SVG overlay that fills on long press ── */}
@@ -485,19 +578,8 @@ function Widget() {
                       maxWidth: 420,
                     }}
                   >
-                    {/* dot + label */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
-                      <motion.div
-                        animate={{ opacity: [0.5, 1, 0.5] }}
-                        transition={{ duration: 2, repeat: Infinity }}
-                        style={{ width: 5, height: 5, borderRadius: '50%', flexShrink: 0,
-                          background: CORAL, boxShadow: `0 0 5px ${CORAL}` }}
-                      />
-                      <span style={{ fontFamily: MONO, fontSize: 8.5, color: CORAL,
-                        letterSpacing: '1.5px', textTransform: 'uppercase' }}>
-                        thera
-                      </span>
-                    </div>
+                    {/* mood face */}
+                    <MoodFace emotion={nudgeEmotion} />
 
                     {/* divider */}
                     <div style={{ width: 1, height: 10, background: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />
@@ -535,7 +617,7 @@ function Widget() {
 
       {/* ── SPOTIFY BAR ──────────────────────────────────── */}
       <AnimatePresence>
-        {nowPlaying && (
+        {nowPlaying && widgetVisible && (
           <motion.div
             key="spotify-bar"
             initial={{ opacity: 0, y: -8, scaleY: 0.9 }}

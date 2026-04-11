@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import Intro from "./components/Intro/Intro";
 import Onboarding from "./components/Onboarding/Onboarding";
@@ -11,6 +11,10 @@ const { ipcRenderer } = window.require ? window.require('electron') : {};
 function App() {
 
   const [introDone, setIntroDone] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [opening, setOpening] = useState(false);
+  const closingTimer = useRef(null);
+  const openingTimer = useRef(null);
   const [showHome, setShowHome] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [dark, setDark] = useState(true);
@@ -29,6 +33,29 @@ function App() {
     const onCrisis = (_e, payload) => setCrisis(payload);
     ipcRenderer.on?.('crisis:trigger', onCrisis);
     return () => ipcRenderer.removeListener?.('crisis:trigger', onCrisis);
+  }, []);
+
+  // Window physically flies to widget — fade content out while it moves
+  useEffect(() => {
+    if (!ipcRenderer) return;
+    const onClose = () => {
+      setOpening(false);
+      setClosing(true);
+      closingTimer.current = setTimeout(() => setClosing(false), 500);
+    };
+    const onOpen = () => {
+      setClosing(false);
+      setOpening(true);
+      openingTimer.current = setTimeout(() => setOpening(false), 500);
+    };
+    ipcRenderer.on('start-close-animation', onClose);
+    ipcRenderer.on('start-open-animation',  onOpen);
+    return () => {
+      ipcRenderer.removeListener('start-close-animation', onClose);
+      ipcRenderer.removeListener('start-open-animation',  onOpen);
+      clearTimeout(closingTimer.current);
+      clearTimeout(openingTimer.current);
+    };
   }, []);
 
   const dismissCrisis = async () => {
@@ -65,12 +92,15 @@ function App() {
 
   if (checkingSettings) {
     return (
-      <div style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }} />
+      <div className={closing ? 'fly-out' : opening ? 'fly-in' : ''} style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }} />
     );
   }
 
   return (
-    <div style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }}>
+    <div
+      className={closing ? 'fly-out' : opening ? 'fly-in' : ''}
+      style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }}
+    >
 
       <AnimatePresence mode="wait">
 

@@ -8,7 +8,7 @@ html, body, #root {
   height: 100%;
   margin: 0;
   padding: 0;
-  background: #18120a;
+  background: transparent;  /* window is transparent: true — App div owns the background */
   color: #f0e6d2;
   font-family: 'Space Grotesk', system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -18,3 +18,26 @@ html, body, #root {
 ::-webkit-scrollbar { width: 0px; }
 input, button, textarea { font-family: inherit; }
 input::placeholder { color: #36250f !important; }
+
+/* ── Close: app fades + scales down as window flies to widget ── */
+@keyframes fly-out {
+  0%   { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(0.72); }
+}
+.fly-out {
+  animation: fly-out 0.35s ease-in forwards;
+  transform-origin: top center;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+
+/* ── Open: app fades + scales up as window expands from widget ── */
+@keyframes fly-in {
+  0%   { opacity: 0; transform: scale(0.72); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.fly-in {
+  animation: fly-in 0.35s ease-out forwards;
+  transform-origin: top center;
+  will-change: transform, opacity;
+}

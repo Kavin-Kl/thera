@@ -89,8 +89,23 @@ function categorizeApp(appName, windowTitle) {
   return 'other';
 }
 
+function getEmotion(type, metadata) {
+  if (type === 'social-quick') return 'concerned';
+  if (type === 'intelligent') {
+    const patterns = (metadata && metadata.patterns) || [];
+    const types = patterns.map(p => (p.type || '').toLowerCase());
+    if (types.some(t => t.includes('doom') || t.includes('social'))) return 'concerned';
+    if (types.some(t => t.includes('late-night') || t.includes('overwork'))) return 'stressed';
+    if (types.some(t => t.includes('stuck'))) return 'sad';
+    if (metadata && metadata.spotifyLoop) return 'content';
+    return 'neutral';
+  }
+  return 'neutral';
+}
+
 function sendNudge(type, message, metadata = {}) {
-  console.log(`[NUDGE] ${type}: "${message}"`);
+  const emotion = getEmotion(type, metadata);
+  console.log(`[NUDGE] ${type} (${emotion}): "${message}"`);
   if (metadata.reasoning) {
     console.log(`[NUDGE] Reasoning: ${metadata.reasoning}`);
   }
@@ -99,7 +114,7 @@ function sendNudge(type, message, metadata = {}) {
 
   const widget = BrowserWindow.getAllWindows().find(w => w.isAlwaysOnTop() && !w.frame);
   if (widget) {
-    widget.webContents.send('show-nudge', message);
+    widget.webContents.send('show-nudge', { text: message, emotion });
   } else {
     console.warn('[NUDGE] No widget window found');
   }

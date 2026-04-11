@@ -12,7 +12,9 @@
       "Bash(timeout /t 5 /nobreak)",
       "Bash(taskkill /F /PID 857816)",
       "Bash(timeout /t 3 /nobreak)",
-      "Bash(taskkill:*)"
+      "Bash(taskkill:*)",
+      "Bash(identify /Users/nithin/Developer/theranew/thera/thera.png)",
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/nithin/Developer/theranew/thera/thera.png)"
     ],
     "deny": [],
     "ask": []
