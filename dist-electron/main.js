@@ -98,17 +98,17 @@ var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 
   CREATE TABLE IF NOT EXISTS mood_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    score INTEGER NOT NULL,           -- -2..+2
-    label TEXT,                       -- low / flat / ok / good / great
+    score INTEGER NOT NULL,
+    label TEXT,
     note TEXT,
-    source TEXT,                      -- 'chat' | 'manual' | 'ritual'
+    source TEXT,
     session_id TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now'))
   );
 
   CREATE TABLE IF NOT EXISTS crisis_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    severity TEXT NOT NULL,           -- 'amber' | 'red'
+    severity TEXT NOT NULL,
     trigger TEXT,
     session_id TEXT,
     resolved_at INTEGER,
@@ -117,101 +117,105 @@ var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 
   CREATE INDEX IF NOT EXISTS idx_mood_created ON mood_entries(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_crisis_created ON crisis_events(created_at DESC);
-
   CREATE INDEX IF NOT EXISTS idx_activity_started ON activity_logs(started_at);
   CREATE INDEX IF NOT EXISTS idx_activity_app ON activity_logs(app_name);
   CREATE INDEX IF NOT EXISTS idx_nudge_sent ON nudge_history(sent_at);
   CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 `);
+	for (const sql of [
+		`ALTER TABLE mood_entries ADD COLUMN user_id TEXT NOT NULL DEFAULT 'desktop_user'`,
+		`ALTER TABLE crisis_events ADD COLUMN user_id TEXT NOT NULL DEFAULT 'desktop_user'`,
+		`CREATE INDEX IF NOT EXISTS idx_mood_user ON mood_entries(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_crisis_user ON crisis_events(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`
+	]) try {
+		db.exec(sql);
+	} catch (_) {}
 	console.log("[DB] Database initialized at:", dbPath);
 	var activityOps = {
-		startSession(appName, windowTitle, category) {
-			const stmt = db.prepare(`
-      INSERT INTO activity_logs (app_name, window_title, started_at, category)
-      VALUES (?, ?, ?, ?)
-    `);
+		startSession(appName, windowTitle, category, userId = "desktop_user") {
 			const now = Date.now();
-			return stmt.run(appName, windowTitle, now, category).lastInsertRowid;
+			return db.prepare(`
+      INSERT INTO activity_logs (app_name, window_title, started_at, category, user_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(appName, windowTitle, now, category, userId).lastInsertRowid;
 		},
 		endSession(id) {
-			const stmt = db.prepare(`
+			const now = Date.now();
+			db.prepare(`
       UPDATE activity_logs
       SET ended_at = ?, duration_seconds = (? - started_at) / 1000
       WHERE id = ?
-    `);
-			const now = Date.now();
-			stmt.run(now, now, id);
+    `).run(now, now, id);
 		},
-		getRecentActivity(hours = 24) {
-			const stmt = db.prepare(`
+		getRecentActivity(hours = 24, userId = "desktop_user") {
+			const since = Date.now() - hours * 60 * 60 * 1e3;
+			return db.prepare(`
       SELECT * FROM activity_logs
-      WHERE started_at > ?
+      WHERE started_at > ? AND user_id = ?
       ORDER BY started_at DESC
       LIMIT 100
-    `);
-			const since = Date.now() - hours * 60 * 60 * 1e3;
-			return stmt.all(since);
+    `).all(since, userId);
 		},
-		getCurrentAppDuration(appName) {
-			const stmt = db.prepare(`
-      SELECT SUM(duration_seconds) as total
-      FROM activity_logs
-      WHERE app_name = ? AND started_at > ?
-    `);
+		getCurrentAppDuration(appName, userId = "desktop_user") {
 			const since = Date.now() - 1440 * 60 * 1e3;
-			return stmt.get(appName, since)?.total || 0;
-		},
-		getCategoryDuration(category, hours = 24) {
-			const stmt = db.prepare(`
+			return db.prepare(`
       SELECT SUM(duration_seconds) as total
       FROM activity_logs
-      WHERE category = ? AND started_at > ?
-    `);
+      WHERE app_name = ? AND started_at > ? AND user_id = ?
+    `).get(appName, since, userId)?.total || 0;
+		},
+		getCategoryDuration(category, hours = 24, userId = "desktop_user") {
 			const since = Date.now() - hours * 60 * 60 * 1e3;
-			return stmt.get(category, since)?.total || 0;
+			return db.prepare(`
+      SELECT SUM(duration_seconds) as total
+      FROM activity_logs
+      WHERE category = ? AND started_at > ? AND user_id = ?
+    `).get(category, since, userId)?.total || 0;
 		}
 	};
 	var nudgeOps = {
-		recordNudge(type, message) {
+		recordNudge(type, message, userId = "desktop_user") {
 			return db.prepare(`
-      INSERT INTO nudge_history (nudge_type, message)
-      VALUES (?, ?)
-    `).run(type, message).lastInsertRowid;
+      INSERT INTO nudge_history (nudge_type, message, user_id)
+      VALUES (?, ?, ?)
+    `).run(type, message, userId).lastInsertRowid;
 		},
-		getLastNudge(type) {
+		getLastNudge(type, userId = "desktop_user") {
 			return db.prepare(`
       SELECT * FROM nudge_history
-      WHERE nudge_type = ?
+      WHERE nudge_type = ? AND user_id = ?
       ORDER BY sent_at DESC
       LIMIT 1
-    `).get(type);
+    `).get(type, userId);
 		},
-		shouldNudge(type, cooldownMinutes) {
-			const lastNudge = this.getLastNudge(type);
+		shouldNudge(type, cooldownMinutes, userId = "desktop_user") {
+			const lastNudge = this.getLastNudge(type, userId);
 			if (!lastNudge) return true;
 			const cooldownMs = cooldownMinutes * 60 * 1e3;
 			return Date.now() - lastNudge.sent_at * 1e3 > cooldownMs;
 		}
 	};
 	var sessionOps = {
-		create(id, title = "new session") {
+		create(id, title = "new session", userId = "desktop_user") {
 			db.prepare(`
-      INSERT INTO sessions (id, title, created_at, updated_at)
-      VALUES (?, ?, strftime('%s','now'), strftime('%s','now'))
-    `).run(id, title);
+      INSERT INTO sessions (id, title, user_id, created_at, updated_at)
+      VALUES (?, ?, ?, strftime('%s','now'), strftime('%s','now'))
+    `).run(id, title, userId);
 			return {
 				id,
 				title
 			};
 		},
-		list(limit = 50) {
+		list(userId = "desktop_user", limit = 50) {
 			return db.prepare(`
       SELECT id, title, created_at, updated_at
       FROM sessions
+      WHERE user_id = ?
       ORDER BY updated_at DESC
       LIMIT ?
-    `).all(limit);
+    `).all(userId, limit);
 		},
 		rename(id, title) {
 			db.prepare(`
@@ -260,6 +264,17 @@ var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
         VALUES (?, ?, ?, ?)
       `).run(key, enabled ? 1 : 0, status || "disconnected", metadata || null);
 			},
+			listForUser(userId = "desktop_user") {
+				const prefix = `${userId}:`;
+				return db.prepare(`
+      SELECT key, enabled, status, metadata FROM connectors
+      WHERE key LIKE ?
+    `).all(`${prefix}%`).map((r) => ({
+					...r,
+					key: r.key.slice(prefix.length),
+					enabled: !!r.enabled
+				}));
+			},
 			list() {
 				return db.prepare(`SELECT key, enabled, status, metadata FROM connectors`).all().map((r) => ({
 					...r,
@@ -275,13 +290,13 @@ var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			}
 		},
 		moodOps: {
-			log({ score, label, note, source = "chat", session_id = null }) {
+			log({ score, label, note, source = "chat", session_id = null, user_id = "desktop_user" }) {
 				return db.prepare(`
-      INSERT INTO mood_entries (score, label, note, source, session_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(score, label || null, note || null, source, session_id).lastInsertRowid;
+      INSERT INTO mood_entries (score, label, note, source, session_id, user_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(score, label || null, note || null, source, session_id, user_id).lastInsertRowid;
 			},
-			daily(days = 30) {
+			daily(days = 30, userId = "desktop_user") {
 				const since = Math.floor(Date.now() / 1e3) - days * 86400;
 				return db.prepare(`
       SELECT
@@ -289,35 +304,41 @@ var require_localDb = /* @__PURE__ */ __commonJSMin(((exports, module) => {
         AVG(score) AS avg_score,
         COUNT(*) AS count
       FROM mood_entries
-      WHERE created_at >= ?
+      WHERE created_at >= ? AND user_id = ?
       GROUP BY day
       ORDER BY day ASC
-    `).all(since);
+    `).all(since, userId);
 			},
-			recent(limit = 20) {
+			recent(limit = 20, userId = "desktop_user") {
 				return db.prepare(`
       SELECT id, score, label, note, source, created_at
-      FROM mood_entries ORDER BY id DESC LIMIT ?
-    `).all(limit);
+      FROM mood_entries
+      WHERE user_id = ?
+      ORDER BY id DESC LIMIT ?
+    `).all(userId, limit);
 			}
 		},
 		crisisOps: {
-			record({ severity, trigger, session_id = null }) {
+			record({ severity, trigger, session_id = null, user_id = "desktop_user" }) {
 				return db.prepare(`
-      INSERT INTO crisis_events (severity, trigger, session_id)
-      VALUES (?, ?, ?)
-    `).run(severity, trigger || null, session_id).lastInsertRowid;
+      INSERT INTO crisis_events (severity, trigger, session_id, user_id)
+      VALUES (?, ?, ?, ?)
+    `).run(severity, trigger || null, session_id, user_id).lastInsertRowid;
 			},
 			resolve(id) {
 				db.prepare(`UPDATE crisis_events SET resolved_at = strftime('%s','now') WHERE id = ?`).run(id);
 			},
-			active() {
+			active(userId = "desktop_user") {
 				return db.prepare(`
-      SELECT * FROM crisis_events WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1
-    `).get();
+      SELECT * FROM crisis_events
+      WHERE resolved_at IS NULL AND user_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(userId);
 			},
-			recent(limit = 10) {
-				return db.prepare(`SELECT * FROM crisis_events ORDER BY id DESC LIMIT ?`).all(limit);
+			recent(limit = 10, userId = "desktop_user") {
+				return db.prepare(`
+      SELECT * FROM crisis_events WHERE user_id = ? ORDER BY id DESC LIMIT ?
+    `).all(userId, limit);
 			}
 		}
 	};
@@ -328,15 +349,21 @@ var require_tokenStore = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	/**
 	* Token storage for connector OAuth credentials.
 	*
-	* Stored as a JSON file in the userData directory. Not encrypted on disk —
-	* good enough for a local-first desktop companion. If you need hardening,
-	* swap this for safeStorage.encryptString later.
+	* Stored in the userData directory, encrypted with Electron safeStorage when
+	* available. Tokens are namespaced per Supabase user ID so each profile has
+	* isolated connector credentials.
 	*/
 	var fs$2 = require("fs");
 	var path$2 = require("path");
 	var { app: app$1, safeStorage } = require("electron");
 	var TOKEN_PATH = path$2.join(app$1.getPath("userData"), "thera-tokens.json");
 	var cache = null;
+	var currentUserId = "desktop_user";
+	/** Called by main.js when auth state changes. */
+	function setUser(userId) {
+		currentUserId = userId || "desktop_user";
+		cache = null;
+	}
 	function load() {
 		if (cache) return cache;
 		try {
@@ -367,28 +394,48 @@ var require_tokenStore = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			console.error("[TOKENS] Failed to save:", e.message);
 		}
 	}
-	function get(provider) {
-		return load()[provider] || null;
+	/** Build the namespaced storage key. */
+	function _key(provider) {
+		return `${currentUserId}:${provider}`;
 	}
+	/** Retrieve tokens for a provider under the current user. */
+	function get(provider) {
+		const all = load();
+		return all[_key(provider)] || all[provider] || null;
+	}
+	/** Store tokens for a provider under the current user. */
 	function set(provider, tokens) {
 		const all = load();
-		all[provider] = {
+		all[_key(provider)] = {
 			...tokens,
 			_savedAt: Date.now()
 		};
+		delete all[provider];
 		cache = all;
 		save();
 	}
+	/** Clear tokens for a provider under the current user. */
 	function clear(provider) {
 		const all = load();
+		delete all[_key(provider)];
 		delete all[provider];
+		cache = all;
+		save();
+	}
+	/** Clear ALL tokens for the current user (used on disconnect all). */
+	function clearUser() {
+		const all = load();
+		const prefix = `${currentUserId}:`;
+		for (const key of Object.keys(all)) if (key.startsWith(prefix)) delete all[key];
 		cache = all;
 		save();
 	}
 	module.exports = {
 		get,
 		set,
-		clear
+		clear,
+		setUser,
+		clearUser
 	};
 }));
 //#endregion
@@ -407,7 +454,7 @@ var require_oauthLoopback = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 	* Higher-level helper: starts the loopback, calls `buildAuthUrl(port)` to get
 	* the URL to open in the browser, opens it, and returns the OAuth callback query.
 	*/
-	async function runOAuthFlow({ buildAuthUrl, callbackPath = "/oauth/callback", fixedPort = 0 }) {
+	async function runOAuthFlow$1({ buildAuthUrl, callbackPath = "/oauth/callback", fixedPort = 0 }) {
 		const { shell } = require("electron");
 		return new Promise((resolve, reject) => {
 			const server = http.createServer((req, res) => {
@@ -459,7 +506,7 @@ var require_oauthLoopback = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 			});
 		});
 	}
-	module.exports = { runOAuthFlow };
+	module.exports = { runOAuthFlow: runOAuthFlow$1 };
 }));
 //#endregion
 //#region electron/connectors/google.js
@@ -2505,10 +2552,13 @@ var googleConnector = require_google();
 var spotifyConnector = require_spotify();
 var slackConnector = require_slack();
 var actions = require_actions();
+var tokenStore = require_tokenStore();
+var { runOAuthFlow } = require_oauthLoopback();
 var mainWindow;
 var widgetWindow;
 var tray;
 var closingAnimation = false;
+var currentUserId = "desktop_user";
 function createWindow() {
 	mainWindow = new BrowserWindow({
 		width: 900,
@@ -2776,16 +2826,37 @@ ipcMain.on("set-widget-interactive", (_e, interactive) => {
 });
 ipcMain.handle("get-setting", (_e, key) => settings.get(key));
 ipcMain.on("set-setting", (_e, key, value) => settings.set(key, value));
+ipcMain.on("auth:set-user", (_e, userId) => {
+	currentUserId = userId || "desktop_user";
+	tokenStore.setUser(currentUserId);
+	console.log("[AUTH] User set to:", currentUserId);
+	syncConnectorStates();
+});
+var AUTH_CALLBACK_PORT = 51235;
+ipcMain.handle("auth:google-oauth", async (_e, authUrl) => {
+	try {
+		const query = await runOAuthFlow({
+			buildAuthUrl: () => authUrl,
+			callbackPath: "/auth/callback",
+			fixedPort: AUTH_CALLBACK_PORT
+		});
+		console.log("[AUTH] Google OAuth callback received");
+		return { code: query.code };
+	} catch (e) {
+		console.error("[AUTH] Google OAuth failed:", e.message);
+		return { error: e.message };
+	}
+});
 var widgetActions = require_widgetActions();
 ipcMain.handle("widget:spotify:next", () => widgetActions.spotifyNext());
 ipcMain.handle("widget:spotify:previous", () => widgetActions.spotifyPrevious());
 ipcMain.handle("widget:spotify:toggle", () => widgetActions.spotifyToggle());
 ipcMain.handle("widget:spotify:disable-repeat", () => widgetActions.spotifyDisableRepeat());
 ipcMain.handle("widget:spotify:get-current", () => widgetActions.spotifyGetCurrent());
-ipcMain.handle("sessions:list", () => sessionOps.list());
+ipcMain.handle("sessions:list", () => sessionOps.list(currentUserId));
 ipcMain.handle("sessions:create", (_e, { id, title } = {}) => {
 	const sessionId = id || `thera_${Date.now()}`;
-	return sessionOps.create(sessionId, title || "new session");
+	return sessionOps.create(sessionId, title || "new session", currentUserId);
 });
 ipcMain.handle("sessions:rename", (_e, { id, title }) => {
 	sessionOps.rename(id, title);
@@ -2799,15 +2870,6 @@ ipcMain.handle("sessions:messages", (_e, { id }) => messageOps.listForSession(id
 ipcMain.handle("sessions:add-message", (_e, { sessionId, role, text }) => {
 	return messageOps.add(sessionId, role, text);
 });
-ipcMain.handle("connectors:list", () => connectorOps.list());
-ipcMain.handle("connectors:upsert", (_e, { key, enabled, status, metadata }) => {
-	connectorOps.upsert(key, {
-		enabled,
-		status,
-		metadata
-	});
-	return connectorOps.get(key);
-});
 var GOOGLE_KEYS = [
 	"gmail",
 	"gcal",
@@ -2816,20 +2878,50 @@ var GOOGLE_KEYS = [
 	"gdocs",
 	"gsheets"
 ];
+/** Build a per-user connector key for the DB. */
+function userKey(connector) {
+	return `${currentUserId}:${connector}`;
+}
 function syncConnectorStates() {
-	if (googleConnector.isConnected()) GOOGLE_KEYS.forEach((k) => connectorOps.upsert(k, {
+	if (googleConnector.isConnected()) GOOGLE_KEYS.forEach((k) => connectorOps.upsert(userKey(k), {
 		enabled: true,
 		status: "connected"
 	}));
-	if (spotifyConnector.isConnected()) connectorOps.upsert("spotify", {
+	else GOOGLE_KEYS.forEach((k) => connectorOps.upsert(userKey(k), {
+		enabled: false,
+		status: "disconnected"
+	}));
+	if (spotifyConnector.isConnected()) connectorOps.upsert(userKey("spotify"), {
 		enabled: true,
 		status: "connected"
 	});
-	if (slackConnector.isConnected()) connectorOps.upsert("slack", {
+	else connectorOps.upsert(userKey("spotify"), {
+		enabled: false,
+		status: "disconnected"
+	});
+	if (slackConnector.isConnected()) connectorOps.upsert(userKey("slack"), {
 		enabled: true,
 		status: "connected"
+	});
+	else connectorOps.upsert(userKey("slack"), {
+		enabled: false,
+		status: "disconnected"
 	});
 }
+ipcMain.handle("connectors:list", () => connectorOps.listForUser(currentUserId));
+ipcMain.handle("connectors:upsert", (_e, { key, enabled, status, metadata }) => {
+	const dbKey = userKey(key);
+	connectorOps.upsert(dbKey, {
+		enabled,
+		status,
+		metadata
+	});
+	const r = connectorOps.get(dbKey);
+	return r ? {
+		...r,
+		key
+	} : null;
+});
 ipcMain.handle("connectors:credentials", () => ({
 	google: googleConnector.hasCredentials(),
 	spotify: spotifyConnector.hasCredentials(),
@@ -2838,7 +2930,7 @@ ipcMain.handle("connectors:credentials", () => ({
 ipcMain.handle("connectors:google:connect", async () => {
 	try {
 		await googleConnector.connect();
-		GOOGLE_KEYS.forEach((k) => connectorOps.upsert(k, {
+		GOOGLE_KEYS.forEach((k) => connectorOps.upsert(userKey(k), {
 			enabled: true,
 			status: "connected"
 		}));
@@ -2853,7 +2945,7 @@ ipcMain.handle("connectors:google:connect", async () => {
 });
 ipcMain.handle("connectors:google:disconnect", async () => {
 	googleConnector.disconnect();
-	GOOGLE_KEYS.forEach((k) => connectorOps.upsert(k, {
+	GOOGLE_KEYS.forEach((k) => connectorOps.upsert(userKey(k), {
 		enabled: false,
 		status: "disconnected"
 	}));
@@ -2862,7 +2954,7 @@ ipcMain.handle("connectors:google:disconnect", async () => {
 ipcMain.handle("connectors:spotify:connect", async () => {
 	try {
 		await spotifyConnector.connect();
-		connectorOps.upsert("spotify", {
+		connectorOps.upsert(userKey("spotify"), {
 			enabled: true,
 			status: "connected"
 		});
@@ -2877,7 +2969,7 @@ ipcMain.handle("connectors:spotify:connect", async () => {
 });
 ipcMain.handle("connectors:spotify:disconnect", () => {
 	spotifyConnector.disconnect();
-	connectorOps.upsert("spotify", {
+	connectorOps.upsert(userKey("spotify"), {
 		enabled: false,
 		status: "disconnected"
 	});
@@ -2886,7 +2978,7 @@ ipcMain.handle("connectors:spotify:disconnect", () => {
 ipcMain.handle("connectors:slack:connect", async () => {
 	try {
 		await slackConnector.connect();
-		connectorOps.upsert("slack", {
+		connectorOps.upsert(userKey("slack"), {
 			enabled: true,
 			status: "connected"
 		});
@@ -2901,27 +2993,34 @@ ipcMain.handle("connectors:slack:connect", async () => {
 });
 ipcMain.handle("connectors:slack:disconnect", () => {
 	slackConnector.disconnect();
-	connectorOps.upsert("slack", {
+	connectorOps.upsert(userKey("slack"), {
 		enabled: false,
 		status: "disconnected"
 	});
 	return { ok: true };
 });
 ipcMain.handle("actions:execute", (_e, action) => actions.execute(action));
-ipcMain.handle("mood:log", (_e, entry) => moodOps.log(entry || {}));
-ipcMain.handle("mood:daily", (_e, days) => moodOps.daily(days || 30));
-ipcMain.handle("mood:recent", (_e, limit) => moodOps.recent(limit || 20));
-ipcMain.handle("crisis:record", (_e, evt) => crisisOps.record(evt || { severity: "amber" }));
+ipcMain.handle("mood:log", (_e, entry) => moodOps.log({
+	...entry || {},
+	user_id: currentUserId
+}));
+ipcMain.handle("mood:daily", (_e, days) => moodOps.daily(days || 30, currentUserId));
+ipcMain.handle("mood:recent", (_e, limit) => moodOps.recent(limit || 20, currentUserId));
+ipcMain.handle("crisis:record", (_e, evt) => crisisOps.record({
+	severity: "amber",
+	...evt || {},
+	user_id: currentUserId
+}));
 ipcMain.handle("crisis:resolve", (_e, id) => {
 	crisisOps.resolve(id);
 	return true;
 });
-ipcMain.handle("crisis:active", () => crisisOps.active());
+ipcMain.handle("crisis:active", () => crisisOps.active(currentUserId));
 ipcMain.handle("roast:context", () => {
 	return {
-		moodDays: moodOps.daily(7),
-		moodRecent: moodOps.recent(50),
-		activity: require_localDb().activityOps.getRecentActivity(168)
+		moodDays: moodOps.daily(7, currentUserId),
+		moodRecent: moodOps.recent(50, currentUserId),
+		activity: require_localDb().activityOps.getRecentActivity(168, currentUserId)
 	};
 });
 ipcMain.handle("request-permissions", async () => {

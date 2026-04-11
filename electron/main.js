@@ -27,12 +27,17 @@ const googleConnector = require('./connectors/google');
 const spotifyConnector = require('./connectors/spotify');
 const slackConnector = require('./connectors/slack');
 const actions = require('./connectors/actions');
+const tokenStore = require('./connectors/tokenStore');
+const { runOAuthFlow } = require('./connectors/oauthLoopback');
 
 let mainWindow;
 let widgetWindow;
 let tray;
 let store;
 let closingAnimation = false; // prevents blur handler from hiding window mid-animation
+
+// Current authenticated user — updated via auth:set-user IPC
+let currentUserId = 'desktop_user';
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -404,6 +409,33 @@ ipcMain.on('set-widget-interactive', (_e, interactive) => {
 ipcMain.handle('get-setting', (_e, key) => settings.get(key));
 ipcMain.on('set-setting', (_e, key, value) => settings.set(key, value));
 
+// ── Auth ──────────────────────────────────────────────────────
+// Renderer notifies main of the current Supabase user on login/logout
+ipcMain.on('auth:set-user', (_e, userId) => {
+  currentUserId = userId || 'desktop_user';
+  tokenStore.setUser(currentUserId);
+  console.log('[AUTH] User set to:', currentUserId);
+  syncConnectorStates(); // re-sync connector UI for this user
+});
+
+// Supabase Google OAuth via loopback — renderer sends the OAuth URL,
+// main opens it in the system browser and captures the code.
+const AUTH_CALLBACK_PORT = 51235;
+ipcMain.handle('auth:google-oauth', async (_e, authUrl) => {
+  try {
+    const query = await runOAuthFlow({
+      buildAuthUrl: () => authUrl,
+      callbackPath: '/auth/callback',
+      fixedPort: AUTH_CALLBACK_PORT,
+    });
+    console.log('[AUTH] Google OAuth callback received');
+    return { code: query.code };
+  } catch (e) {
+    console.error('[AUTH] Google OAuth failed:', e.message);
+    return { error: e.message };
+  }
+});
+
 // Widget quick actions (Spotify controls)
 const widgetActions = require('./widgetActions');
 ipcMain.handle('widget:spotify:next', () => widgetActions.spotifyNext());
@@ -413,10 +445,10 @@ ipcMain.handle('widget:spotify:disable-repeat', () => widgetActions.spotifyDisab
 ipcMain.handle('widget:spotify:get-current', () => widgetActions.spotifyGetCurrent());
 
 // ── Sessions ──────────────────────────────────────────────────
-ipcMain.handle('sessions:list', () => sessionOps.list());
+ipcMain.handle('sessions:list', () => sessionOps.list(currentUserId));
 ipcMain.handle('sessions:create', (_e, { id, title } = {}) => {
   const sessionId = id || `thera_${Date.now()}`;
-  return sessionOps.create(sessionId, title || 'new session');
+  return sessionOps.create(sessionId, title || 'new session', currentUserId);
 });
 ipcMain.handle('sessions:rename', (_e, { id, title }) => {
   sessionOps.rename(id, title);
@@ -431,28 +463,44 @@ ipcMain.handle('sessions:add-message', (_e, { sessionId, role, text }) => {
   return messageOps.add(sessionId, role, text);
 });
 
-// ── Connectors ────────────────────────────────────────────────
-ipcMain.handle('connectors:list', () => connectorOps.list());
-ipcMain.handle('connectors:upsert', (_e, { key, enabled, status, metadata }) => {
-  connectorOps.upsert(key, { enabled, status, metadata });
-  return connectorOps.get(key);
-});
+// ── Connectors — see per-user handlers registered above ───────
 
 const GOOGLE_KEYS = ['gmail', 'gcal', 'gcontacts', 'gdrive', 'gdocs', 'gsheets'];
 
-// Sync persisted token state into the connectors table on startup so the UI
-// reflects what's actually authenticated even after a restart.
+/** Build a per-user connector key for the DB. */
+function userKey(connector) {
+  return `${currentUserId}:${connector}`;
+}
+
+// Sync persisted token state into the connectors table so the UI reflects
+// what's actually authenticated even after a restart.
 function syncConnectorStates() {
   if (googleConnector.isConnected()) {
-    GOOGLE_KEYS.forEach(k => connectorOps.upsert(k, { enabled: true, status: 'connected' }));
+    GOOGLE_KEYS.forEach(k => connectorOps.upsert(userKey(k), { enabled: true, status: 'connected' }));
+  } else {
+    GOOGLE_KEYS.forEach(k => connectorOps.upsert(userKey(k), { enabled: false, status: 'disconnected' }));
   }
   if (spotifyConnector.isConnected()) {
-    connectorOps.upsert('spotify', { enabled: true, status: 'connected' });
+    connectorOps.upsert(userKey('spotify'), { enabled: true, status: 'connected' });
+  } else {
+    connectorOps.upsert(userKey('spotify'), { enabled: false, status: 'disconnected' });
   }
   if (slackConnector.isConnected()) {
-    connectorOps.upsert('slack', { enabled: true, status: 'connected' });
+    connectorOps.upsert(userKey('slack'), { enabled: true, status: 'connected' });
+  } else {
+    connectorOps.upsert(userKey('slack'), { enabled: false, status: 'disconnected' });
   }
 }
+
+// List connectors for the current user (strips userId prefix before returning)
+ipcMain.handle('connectors:list', () => connectorOps.listForUser(currentUserId));
+
+ipcMain.handle('connectors:upsert', (_e, { key, enabled, status, metadata }) => {
+  const dbKey = userKey(key);
+  connectorOps.upsert(dbKey, { enabled, status, metadata });
+  const r = connectorOps.get(dbKey);
+  return r ? { ...r, key } : null; // strip prefix before returning
+});
 
 ipcMain.handle('connectors:credentials', () => ({
   google: googleConnector.hasCredentials(),
@@ -463,7 +511,7 @@ ipcMain.handle('connectors:credentials', () => ({
 ipcMain.handle('connectors:google:connect', async () => {
   try {
     await googleConnector.connect();
-    GOOGLE_KEYS.forEach(k => connectorOps.upsert(k, { enabled: true, status: 'connected' }));
+    GOOGLE_KEYS.forEach(k => connectorOps.upsert(userKey(k), { enabled: true, status: 'connected' }));
     return { ok: true };
   } catch (e) {
     console.error('[GOOGLE] connect failed:', e.message);
@@ -473,14 +521,14 @@ ipcMain.handle('connectors:google:connect', async () => {
 
 ipcMain.handle('connectors:google:disconnect', async () => {
   googleConnector.disconnect();
-  GOOGLE_KEYS.forEach(k => connectorOps.upsert(k, { enabled: false, status: 'disconnected' }));
+  GOOGLE_KEYS.forEach(k => connectorOps.upsert(userKey(k), { enabled: false, status: 'disconnected' }));
   return { ok: true };
 });
 
 ipcMain.handle('connectors:spotify:connect', async () => {
   try {
     await spotifyConnector.connect();
-    connectorOps.upsert('spotify', { enabled: true, status: 'connected' });
+    connectorOps.upsert(userKey('spotify'), { enabled: true, status: 'connected' });
     return { ok: true };
   } catch (e) {
     console.error('[SPOTIFY] connect failed:', e.message);
@@ -490,14 +538,14 @@ ipcMain.handle('connectors:spotify:connect', async () => {
 
 ipcMain.handle('connectors:spotify:disconnect', () => {
   spotifyConnector.disconnect();
-  connectorOps.upsert('spotify', { enabled: false, status: 'disconnected' });
+  connectorOps.upsert(userKey('spotify'), { enabled: false, status: 'disconnected' });
   return { ok: true };
 });
 
 ipcMain.handle('connectors:slack:connect', async () => {
   try {
     await slackConnector.connect();
-    connectorOps.upsert('slack', { enabled: true, status: 'connected' });
+    connectorOps.upsert(userKey('slack'), { enabled: true, status: 'connected' });
     return { ok: true };
   } catch (e) {
     console.error('[SLACK] connect failed:', e.message);
@@ -507,7 +555,7 @@ ipcMain.handle('connectors:slack:connect', async () => {
 
 ipcMain.handle('connectors:slack:disconnect', () => {
   slackConnector.disconnect();
-  connectorOps.upsert('slack', { enabled: false, status: 'disconnected' });
+  connectorOps.upsert(userKey('slack'), { enabled: false, status: 'disconnected' });
   return { ok: true };
 });
 
@@ -515,20 +563,20 @@ ipcMain.handle('connectors:slack:disconnect', () => {
 ipcMain.handle('actions:execute', (_e, action) => actions.execute(action));
 
 // ── Mood ──────────────────────────────────────────────────────
-ipcMain.handle('mood:log', (_e, entry) => moodOps.log(entry || {}));
-ipcMain.handle('mood:daily', (_e, days) => moodOps.daily(days || 30));
-ipcMain.handle('mood:recent', (_e, limit) => moodOps.recent(limit || 20));
+ipcMain.handle('mood:log', (_e, entry) => moodOps.log({ ...(entry || {}), user_id: currentUserId }));
+ipcMain.handle('mood:daily', (_e, days) => moodOps.daily(days || 30, currentUserId));
+ipcMain.handle('mood:recent', (_e, limit) => moodOps.recent(limit || 20, currentUserId));
 
 // ── Crisis ────────────────────────────────────────────────────
-ipcMain.handle('crisis:record', (_e, evt) => crisisOps.record(evt || { severity: 'amber' }));
+ipcMain.handle('crisis:record', (_e, evt) => crisisOps.record({ severity: 'amber', ...(evt || {}), user_id: currentUserId }));
 ipcMain.handle('crisis:resolve', (_e, id) => { crisisOps.resolve(id); return true; });
-ipcMain.handle('crisis:active', () => crisisOps.active());
+ipcMain.handle('crisis:active', () => crisisOps.active(currentUserId));
 
 // ── Weekly roast: pull last 7 days of mood + activity for Gemini to summarize
 ipcMain.handle('roast:context', () => {
-  const moodDays = moodOps.daily(7);
-  const moodRecent = moodOps.recent(50);
-  const activity = require('./db/localDb').activityOps.getRecentActivity(24 * 7);
+  const moodDays   = moodOps.daily(7, currentUserId);
+  const moodRecent = moodOps.recent(50, currentUserId);
+  const activity   = require('./db/localDb').activityOps.getRecentActivity(24 * 7, currentUserId);
   return { moodDays, moodRecent, activity };
 });
 

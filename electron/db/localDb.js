@@ -55,17 +55,17 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS mood_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    score INTEGER NOT NULL,           -- -2..+2
-    label TEXT,                       -- low / flat / ok / good / great
+    score INTEGER NOT NULL,
+    label TEXT,
     note TEXT,
-    source TEXT,                      -- 'chat' | 'manual' | 'ritual'
+    source TEXT,
     session_id TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now'))
   );
 
   CREATE TABLE IF NOT EXISTS crisis_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    severity TEXT NOT NULL,           -- 'amber' | 'red'
+    severity TEXT NOT NULL,
     trigger TEXT,
     session_id TEXT,
     resolved_at INTEGER,
@@ -74,7 +74,6 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_mood_created ON mood_entries(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_crisis_created ON crisis_events(created_at DESC);
-
   CREATE INDEX IF NOT EXISTS idx_activity_started ON activity_logs(started_at);
   CREATE INDEX IF NOT EXISTS idx_activity_app ON activity_logs(app_name);
   CREATE INDEX IF NOT EXISTS idx_nudge_sent ON nudge_history(sent_at);
@@ -82,119 +81,122 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 `);
 
+// ── Migrations: add user_id to tables that don't have it yet ──
+const migrations = [
+  `ALTER TABLE mood_entries ADD COLUMN user_id TEXT NOT NULL DEFAULT 'desktop_user'`,
+  `ALTER TABLE crisis_events ADD COLUMN user_id TEXT NOT NULL DEFAULT 'desktop_user'`,
+  `CREATE INDEX IF NOT EXISTS idx_mood_user ON mood_entries(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_crisis_user ON crisis_events(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+];
+
+for (const sql of migrations) {
+  try { db.exec(sql); } catch (_) { /* column/index already exists — safe to ignore */ }
+}
+
 console.log('[DB] Database initialized at:', dbPath);
 
-// Activity log operations
+// ── Activity log operations ────────────────────────────────────
 const activityOps = {
-  startSession(appName, windowTitle, category) {
-    const stmt = db.prepare(`
-      INSERT INTO activity_logs (app_name, window_title, started_at, category)
-      VALUES (?, ?, ?, ?)
-    `);
+  startSession(appName, windowTitle, category, userId = 'desktop_user') {
     const now = Date.now();
-    return stmt.run(appName, windowTitle, now, category).lastInsertRowid;
+    return db.prepare(`
+      INSERT INTO activity_logs (app_name, window_title, started_at, category, user_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(appName, windowTitle, now, category, userId).lastInsertRowid;
   },
 
   endSession(id) {
-    const stmt = db.prepare(`
+    const now = Date.now();
+    db.prepare(`
       UPDATE activity_logs
       SET ended_at = ?, duration_seconds = (? - started_at) / 1000
       WHERE id = ?
-    `);
-    const now = Date.now();
-    stmt.run(now, now, id);
+    `).run(now, now, id);
   },
 
-  getRecentActivity(hours = 24) {
-    const stmt = db.prepare(`
+  getRecentActivity(hours = 24, userId = 'desktop_user') {
+    const since = Date.now() - (hours * 60 * 60 * 1000);
+    return db.prepare(`
       SELECT * FROM activity_logs
-      WHERE started_at > ?
+      WHERE started_at > ? AND user_id = ?
       ORDER BY started_at DESC
       LIMIT 100
-    `);
-    const since = Date.now() - (hours * 60 * 60 * 1000);
-    return stmt.all(since);
+    `).all(since, userId);
   },
 
-  getCurrentAppDuration(appName) {
-    const stmt = db.prepare(`
+  getCurrentAppDuration(appName, userId = 'desktop_user') {
+    const since = Date.now() - (24 * 60 * 60 * 1000);
+    const result = db.prepare(`
       SELECT SUM(duration_seconds) as total
       FROM activity_logs
-      WHERE app_name = ? AND started_at > ?
-    `);
-    const since = Date.now() - (24 * 60 * 60 * 1000); // Last 24 hours
-    const result = stmt.get(appName, since);
+      WHERE app_name = ? AND started_at > ? AND user_id = ?
+    `).get(appName, since, userId);
     return result?.total || 0;
   },
 
-  getCategoryDuration(category, hours = 24) {
-    const stmt = db.prepare(`
+  getCategoryDuration(category, hours = 24, userId = 'desktop_user') {
+    const since = Date.now() - (hours * 60 * 60 * 1000);
+    const result = db.prepare(`
       SELECT SUM(duration_seconds) as total
       FROM activity_logs
-      WHERE category = ? AND started_at > ?
-    `);
-    const since = Date.now() - (hours * 60 * 60 * 1000);
-    const result = stmt.get(category, since);
+      WHERE category = ? AND started_at > ? AND user_id = ?
+    `).get(category, since, userId);
     return result?.total || 0;
-  }
+  },
 };
 
-// Nudge operations
+// ── Nudge operations ───────────────────────────────────────────
 const nudgeOps = {
-  recordNudge(type, message) {
-    const stmt = db.prepare(`
-      INSERT INTO nudge_history (nudge_type, message)
-      VALUES (?, ?)
-    `);
-    return stmt.run(type, message).lastInsertRowid;
+  recordNudge(type, message, userId = 'desktop_user') {
+    return db.prepare(`
+      INSERT INTO nudge_history (nudge_type, message, user_id)
+      VALUES (?, ?, ?)
+    `).run(type, message, userId).lastInsertRowid;
   },
 
-  getLastNudge(type) {
-    const stmt = db.prepare(`
+  getLastNudge(type, userId = 'desktop_user') {
+    return db.prepare(`
       SELECT * FROM nudge_history
-      WHERE nudge_type = ?
+      WHERE nudge_type = ? AND user_id = ?
       ORDER BY sent_at DESC
       LIMIT 1
-    `);
-    return stmt.get(type);
+    `).get(type, userId);
   },
 
-  shouldNudge(type, cooldownMinutes) {
-    const lastNudge = this.getLastNudge(type);
+  shouldNudge(type, cooldownMinutes, userId = 'desktop_user') {
+    const lastNudge = this.getLastNudge(type, userId);
     if (!lastNudge) return true;
-
     const cooldownMs = cooldownMinutes * 60 * 1000;
     const timeSince = Date.now() - (lastNudge.sent_at * 1000);
     return timeSince > cooldownMs;
-  }
+  },
 };
 
-// Session operations
+// ── Session operations ─────────────────────────────────────────
 const sessionOps = {
-  create(id, title = 'new session') {
-    const stmt = db.prepare(`
-      INSERT INTO sessions (id, title, created_at, updated_at)
-      VALUES (?, ?, strftime('%s','now'), strftime('%s','now'))
-    `);
-    stmt.run(id, title);
+  create(id, title = 'new session', userId = 'desktop_user') {
+    db.prepare(`
+      INSERT INTO sessions (id, title, user_id, created_at, updated_at)
+      VALUES (?, ?, ?, strftime('%s','now'), strftime('%s','now'))
+    `).run(id, title, userId);
     return { id, title };
   },
 
-  list(limit = 50) {
-    const stmt = db.prepare(`
+  list(userId = 'desktop_user', limit = 50) {
+    return db.prepare(`
       SELECT id, title, created_at, updated_at
       FROM sessions
+      WHERE user_id = ?
       ORDER BY updated_at DESC
       LIMIT ?
-    `);
-    return stmt.all(limit);
+    `).all(userId, limit);
   },
 
   rename(id, title) {
-    const stmt = db.prepare(`
+    db.prepare(`
       UPDATE sessions SET title = ?, updated_at = strftime('%s','now') WHERE id = ?
-    `);
-    stmt.run(title, id);
+    `).run(title, id);
   },
 
   touch(id) {
@@ -206,27 +208,26 @@ const sessionOps = {
   },
 };
 
-// Message operations
+// ── Message operations ─────────────────────────────────────────
 const messageOps = {
   add(sessionId, role, text) {
-    const stmt = db.prepare(`
+    const info = db.prepare(`
       INSERT INTO messages (session_id, role, text) VALUES (?, ?, ?)
-    `);
-    const info = stmt.run(sessionId, role, text);
+    `).run(sessionId, role, text);
     sessionOps.touch(sessionId);
     return info.lastInsertRowid;
   },
 
   listForSession(sessionId) {
-    const stmt = db.prepare(`
+    return db.prepare(`
       SELECT id, role, text, created_at FROM messages
       WHERE session_id = ? ORDER BY id ASC
-    `);
-    return stmt.all(sessionId);
+    `).all(sessionId);
   },
 };
 
-// Connector operations
+// ── Connector operations ───────────────────────────────────────
+// Keys are stored as `userId:connectorName` to isolate per profile.
 const connectorOps = {
   upsert(key, { enabled, status, metadata } = {}) {
     const existing = db.prepare(`SELECT key FROM connectors WHERE key = ?`).get(key);
@@ -252,6 +253,17 @@ const connectorOps = {
     }
   },
 
+  /** List connectors for a specific user (strips userId prefix from key). */
+  listForUser(userId = 'desktop_user') {
+    const prefix = `${userId}:`;
+    return db.prepare(`
+      SELECT key, enabled, status, metadata FROM connectors
+      WHERE key LIKE ?
+    `).all(`${prefix}%`)
+      .map(r => ({ ...r, key: r.key.slice(prefix.length), enabled: !!r.enabled }));
+  },
+
+  /** Legacy list — returns all connectors without filtering. */
   list() {
     return db.prepare(`SELECT key, enabled, status, metadata FROM connectors`).all()
       .map(r => ({ ...r, enabled: !!r.enabled }));
@@ -263,18 +275,16 @@ const connectorOps = {
   },
 };
 
-// Mood operations
+// ── Mood operations ────────────────────────────────────────────
 const moodOps = {
-  log({ score, label, note, source = 'chat', session_id = null }) {
-    const stmt = db.prepare(`
-      INSERT INTO mood_entries (score, label, note, source, session_id)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    return stmt.run(score, label || null, note || null, source, session_id).lastInsertRowid;
+  log({ score, label, note, source = 'chat', session_id = null, user_id = 'desktop_user' }) {
+    return db.prepare(`
+      INSERT INTO mood_entries (score, label, note, source, session_id, user_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(score, label || null, note || null, source, session_id, user_id).lastInsertRowid;
   },
 
-  /** Returns one row per day for the last `days` days, with avg score. */
-  daily(days = 30) {
+  daily(days = 30, userId = 'desktop_user') {
     const since = Math.floor(Date.now() / 1000) - days * 86400;
     return db.prepare(`
       SELECT
@@ -282,41 +292,47 @@ const moodOps = {
         AVG(score) AS avg_score,
         COUNT(*) AS count
       FROM mood_entries
-      WHERE created_at >= ?
+      WHERE created_at >= ? AND user_id = ?
       GROUP BY day
       ORDER BY day ASC
-    `).all(since);
+    `).all(since, userId);
   },
 
-  recent(limit = 20) {
+  recent(limit = 20, userId = 'desktop_user') {
     return db.prepare(`
       SELECT id, score, label, note, source, created_at
-      FROM mood_entries ORDER BY id DESC LIMIT ?
-    `).all(limit);
+      FROM mood_entries
+      WHERE user_id = ?
+      ORDER BY id DESC LIMIT ?
+    `).all(userId, limit);
   },
 };
 
-// Crisis operations
+// ── Crisis operations ──────────────────────────────────────────
 const crisisOps = {
-  record({ severity, trigger, session_id = null }) {
+  record({ severity, trigger, session_id = null, user_id = 'desktop_user' }) {
     return db.prepare(`
-      INSERT INTO crisis_events (severity, trigger, session_id)
-      VALUES (?, ?, ?)
-    `).run(severity, trigger || null, session_id).lastInsertRowid;
+      INSERT INTO crisis_events (severity, trigger, session_id, user_id)
+      VALUES (?, ?, ?, ?)
+    `).run(severity, trigger || null, session_id, user_id).lastInsertRowid;
   },
 
   resolve(id) {
     db.prepare(`UPDATE crisis_events SET resolved_at = strftime('%s','now') WHERE id = ?`).run(id);
   },
 
-  active() {
+  active(userId = 'desktop_user') {
     return db.prepare(`
-      SELECT * FROM crisis_events WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1
-    `).get();
+      SELECT * FROM crisis_events
+      WHERE resolved_at IS NULL AND user_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(userId);
   },
 
-  recent(limit = 10) {
-    return db.prepare(`SELECT * FROM crisis_events ORDER BY id DESC LIMIT ?`).all(limit);
+  recent(limit = 10, userId = 'desktop_user') {
+    return db.prepare(`
+      SELECT * FROM crisis_events WHERE user_id = ? ORDER BY id DESC LIMIT ?
+    `).all(userId, limit);
   },
 };
 

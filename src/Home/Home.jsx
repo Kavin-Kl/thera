@@ -59,7 +59,7 @@ function TypingDots() {
 }
 
 /* ═══════════════════════════════════════════════════════════ */
-export default function Home({ dark, setDark, onOpenSettings }) {
+export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_user' }) {
   const { BG, SURFACE, BORDER, TEXT, MUTED, DIM } = dark ? DARK : LIGHT;
 
   const [input,      setInput]      = useState("");
@@ -72,9 +72,6 @@ export default function Home({ dark, setDark, onOpenSettings }) {
   const bottomRef = useRef(null);
   const conversationRef = useRef([]);
   const conversationIdRef = useRef(null);
-
-  // Temporary userId until we add proper auth
-  const userId = 'desktop_user';
 
   // ── Session loading ────────────────────────────────────────
   const refreshSessions = async () => {

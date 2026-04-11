@@ -1,27 +1,32 @@
 import { useState, useEffect, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import Intro from "./components/Intro/Intro";
+import Auth from "./components/Auth/Auth";
 import Onboarding from "./components/Onboarding/Onboarding";
 import Home from "./Home/Home";
 import Settings from "./components/Settings/Settings";
 import CrisisOverlay from "./components/Crisis/CrisisOverlay";
+import { supabase, supabaseConfigured } from "./services/supabaseClient";
 
 const { ipcRenderer } = window.require ? window.require('electron') : {};
 
 function App() {
+  const [introDone,        setIntroDone]        = useState(false);
+  const [closing,          setClosing]          = useState(false);
+  const [opening,          setOpening]          = useState(false);
+  const closingTimer  = useRef(null);
+  const openingTimer  = useRef(null);
 
-  const [introDone, setIntroDone] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [opening, setOpening] = useState(false);
-  const closingTimer = useRef(null);
-  const openingTimer = useRef(null);
-  const [showHome, setShowHome] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [dark, setDark] = useState(true);
+  const [user,             setUser]             = useState(null);   // Supabase user object
+  const [loadingAuth,      setLoadingAuth]      = useState(true);   // checking session
+
+  const [showHome,         setShowHome]         = useState(false);
+  const [showSettings,     setShowSettings]     = useState(false);
+  const [dark,             setDark]             = useState(true);
   const [checkingSettings, setCheckingSettings] = useState(true);
-  const [crisis, setCrisis] = useState(null); // null | { id, severity }
+  const [crisis,           setCrisis]           = useState(null);
 
-  // Resume any unresolved crisis on launch + listen for new ones
+  // ── Resume crisis + listen for new ones ───────────────────────
   useEffect(() => {
     if (!ipcRenderer) return;
     (async () => {
@@ -35,7 +40,7 @@ function App() {
     return () => ipcRenderer.removeListener?.('crisis:trigger', onCrisis);
   }, []);
 
-  // Window physically flies to widget — fade content out while it moves
+  // ── Window open/close animation signals ───────────────────────
   useEffect(() => {
     if (!ipcRenderer) return;
     const onClose = () => {
@@ -58,20 +63,49 @@ function App() {
     };
   }, []);
 
-  const dismissCrisis = async () => {
-    if (crisis?.id && ipcRenderer) {
-      try { await ipcRenderer.invoke('crisis:resolve', crisis.id); } catch (_) {}
-    }
-    setCrisis(null);
-  };
-
-  // Check if onboarding has been completed
+  // ── Check Supabase session on mount ───────────────────────────
   useEffect(() => {
+    if (!supabaseConfigured || !supabase) {
+      // Supabase not configured — boot with a synthetic local user so the
+      // rest of the app works in "unconfigured" mode.
+      setUser({ id: 'desktop_user', email: null });
+      setLoadingAuth(false);
+      return;
+    }
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        setUser(session.user);
+        ipcRenderer?.send('auth:set-user', session.user.id);
+      }
+      setLoadingAuth(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      const u = session?.user || null;
+      setUser(u);
+      ipcRenderer?.send('auth:set-user', u?.id || null);
+      if (!u) {
+        // Signed out — reset UI
+        setShowHome(false);
+        setCheckingSettings(true);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ── Check per-user onboarding state after auth ───────────────
+  useEffect(() => {
+    if (loadingAuth || !user) return;
+
     const checkOnboarding = async () => {
       try {
-        const completed = await ipcRenderer?.invoke('get-setting', 'onboardingCompleted');
+        // Onboarding key is namespaced per user to allow different profiles
+        const key = `onboardingCompleted_${user.id}`;
+        const completed = await ipcRenderer?.invoke('get-setting', key);
         if (completed) {
-          setIntroDone(true); // skip intro animation on subsequent opens
+          setIntroDone(true);
           setShowHome(true);
         }
       } catch (err) {
@@ -81,29 +115,78 @@ function App() {
       }
     };
     checkOnboarding();
-  }, []);
+  }, [user, loadingAuth]);
 
-  // Show nothing while checking settings (but after intro)
+  const dismissCrisis = async () => {
+    if (crisis?.id && ipcRenderer) {
+      try { await ipcRenderer.invoke('crisis:resolve', crisis.id); } catch (_) {}
+    }
+    setCrisis(null);
+  };
+
+  // ── Sign out ───────────────────────────────────────────────────
+  const handleSignOut = async () => {
+    try {
+      if (supabase) await supabase.auth.signOut();
+    } catch (_) {}
+    ipcRenderer?.send('auth:set-user', null);
+    setShowSettings(false);
+    setShowHome(false);
+    setUser(null);
+    setCheckingSettings(true);
+  };
+
+  // ── Onboarding complete ────────────────────────────────────────
+  const handleOnboardingComplete = (answers) => {
+    try {
+      const key = `onboardingCompleted_${user?.id || 'desktop_user'}`;
+      ipcRenderer?.send('set-setting', key, true);
+      ipcRenderer?.send('set-setting', `onboardingData_${user?.id || 'desktop_user'}`, answers);
+      if (answers.nsfw_mode) {
+        const nsfwEnabled = answers.nsfw_mode.includes('on —');
+        ipcRenderer?.send('set-setting', 'nsfwMode', nsfwEnabled);
+      }
+    } catch (err) {
+      console.error('Failed to save onboarding data:', err);
+    }
+    setShowHome(true);
+  };
+
+  /* ── Loading states ─────────────────────────────────────────── */
+  const BG = dark ? '#18120a' : '#f5ede0';
+  const animClass = closing ? 'fly-out' : opening ? 'fly-in' : '';
+
+  // Show intro first — always
   if (!introDone) {
+    return <Intro onFinish={() => setIntroDone(true)} />;
+  }
+
+  // Checking auth session
+  if (loadingAuth) {
+    return <div className={animClass} style={{ background: BG, minHeight: '100vh' }} />;
+  }
+
+  // Not authenticated → show auth page
+  if (!user) {
     return (
-      <Intro onFinish={() => setIntroDone(true)} />
+      <div className={animClass} style={{ background: BG, minHeight: '100vh' }}>
+        <Auth onAuth={(u) => {
+          setUser(u);
+          ipcRenderer?.send('auth:set-user', u.id);
+        }} />
+      </div>
     );
   }
 
+  // Authenticated — checking per-user onboarding setting
   if (checkingSettings) {
-    return (
-      <div className={closing ? 'fly-out' : opening ? 'fly-in' : ''} style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }} />
-    );
+    return <div className={animClass} style={{ background: BG, minHeight: '100vh' }} />;
   }
 
+  /* ── Main app ────────────────────────────────────────────────── */
   return (
-    <div
-      className={closing ? 'fly-out' : opening ? 'fly-in' : ''}
-      style={{ background: dark ? "#18120a" : "#f5ede0", minHeight: "100vh" }}
-    >
-
+    <div className={animClass} style={{ background: BG, minHeight: '100vh' }}>
       <AnimatePresence mode="wait">
-
         {!showHome && (
           <motion.div
             key="onboarding"
@@ -111,22 +194,7 @@ function App() {
             exit={{ opacity: 0 }}
             transition={{ duration: 1 }}
           >
-            <Onboarding onComplete={(answers) => {
-              // Save onboarding answers
-              try {
-                ipcRenderer?.send('set-setting', 'onboardingData', answers);
-                ipcRenderer?.send('set-setting', 'onboardingCompleted', true);
-
-                // Save NSFW mode setting
-                if (answers.nsfw_mode) {
-                  const nsfwEnabled = answers.nsfw_mode.includes('on —');
-                  ipcRenderer?.send('set-setting', 'nsfwMode', nsfwEnabled);
-                }
-              } catch (err) {
-                console.error('Failed to save onboarding data:', err);
-              }
-              setShowHome(true);
-            }} />
+            <Onboarding onComplete={handleOnboardingComplete} />
           </motion.div>
         )}
 
@@ -137,22 +205,24 @@ function App() {
             animate={{ opacity: 1 }}
             transition={{ duration: 1 }}
           >
-            <Home dark={dark} setDark={setDark} onOpenSettings={() => setShowSettings(true)} />
-
+            <Home
+              dark={dark}
+              setDark={setDark}
+              onOpenSettings={() => setShowSettings(true)}
+              userId={user.id}
+            />
           </motion.div>
         )}
-
       </AnimatePresence>
 
       <AnimatePresence>
         {showSettings && (
-          <Settings dark={dark} onClose={() => setShowSettings(false)} onSignOut={async () => {
-            ipcRenderer?.send('set-setting', 'onboardingCompleted', false);
-            ipcRenderer?.send('set-setting', 'onboardingData', null);
-            setShowSettings(false);
-            setShowHome(false);
-            setIntroDone(false);
-          }} />
+          <Settings
+            dark={dark}
+            user={user}
+            onClose={() => setShowSettings(false)}
+            onSignOut={handleSignOut}
+          />
         )}
       </AnimatePresence>
 
@@ -163,7 +233,6 @@ function App() {
           onConfirmSafe={dismissCrisis}
         />
       )}
-
     </div>
   );
 }

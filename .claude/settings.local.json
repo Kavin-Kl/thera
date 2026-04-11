@@ -14,7 +14,9 @@
       "Bash(timeout /t 3 /nobreak)",
       "Bash(taskkill:*)",
       "Bash(identify /Users/nithin/Developer/theranew/thera/thera.png)",
-      "Bash(sips -g pixelWidth -g pixelHeight /Users/nithin/Developer/theranew/thera/thera.png)"
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/nithin/Developer/theranew/thera/thera.png)",
+      "Bash(node -e \"require\\('@supabase/supabase-js'\\); console.log\\('ok'\\)\")",
+      "Bash(node:*)"
     ],
     "deny": [],
     "ask": []

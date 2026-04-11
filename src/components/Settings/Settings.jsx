@@ -31,14 +31,17 @@ const TABS = [
   { id: 'connectors', label: 'connectors' },
   { id: 'mood',       label: 'mood' },
   { id: 'general',    label: 'general' },
+  { id: 'account',    label: 'account' },
   { id: 'about',      label: 'about' },
 ];
 
-export default function Settings({ dark, onClose, onSignOut }) {
+export default function Settings({ dark, onClose, onSignOut, user }) {
   const T = dark ? DARK : LIGHT;
   const [tab, setTab] = useState('connectors');
   const [nsfwMode, setNsfwMode] = useState(false);
   const [showRoast, setShowRoast] = useState(false);
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -50,6 +53,14 @@ export default function Settings({ dark, onClose, onSignOut }) {
 
   const setSetting = (key, value) => {
     if (ipcRenderer) ipcRenderer.send('set-setting', key, value);
+  };
+
+  const handleReset = () => {
+    // Clear per-user onboarding only
+    const uid = user?.id || 'desktop_user';
+    setSetting(`onboardingCompleted_${uid}`, false);
+    setSetting(`onboardingData_${uid}`, null);
+    if (onSignOut) onSignOut();
   };
 
   return (
@@ -93,6 +104,7 @@ export default function Settings({ dark, onClose, onSignOut }) {
       <nav style={{
         display: 'flex', gap: 0, padding: '0 30px',
         borderBottom: `1px solid ${T.BORDER}`, flexShrink: 0,
+        overflowX: 'auto',
       }}>
         {TABS.map(t => {
           const active = t.id === tab;
@@ -103,7 +115,7 @@ export default function Settings({ dark, onClose, onSignOut }) {
               style={{
                 background: 'transparent', border: 'none', cursor: 'pointer',
                 fontFamily: MONO, fontSize: 10, letterSpacing: '1.6px',
-                textTransform: 'uppercase',
+                textTransform: 'uppercase', whiteSpace: 'nowrap',
                 color: active ? CORAL : T.MUTED,
                 padding: '14px 18px',
                 borderBottom: active ? `2px solid ${CORAL}` : '2px solid transparent',
@@ -182,28 +194,72 @@ export default function Settings({ dark, onClose, onSignOut }) {
                 />
               </Row>
 
-              {onSignOut && (
-                <Row T={T}>
-                  <div>
-                    <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: T.TEXT }}>reset & restart</p>
-                    <p style={{ margin: '4px 0 0', fontSize: 12, color: T.MUTED }}>
-                      clears onboarding and starts fresh. useful for demos.
-                    </p>
+              <Row T={T}>
+                <div>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: T.TEXT }}>reset onboarding</p>
+                  <p style={{ margin: '4px 0 0', fontSize: 12, color: T.MUTED }}>
+                    re-runs the setup flow. your account stays, your data stays.
+                  </p>
+                </div>
+                {confirmReset ? (
+                  <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                    <SmallBtn label="yes, reset" onClick={handleReset} color={CORAL} T={T} />
+                    <SmallBtn label="cancel" onClick={() => setConfirmReset(false)} T={T} />
                   </div>
-                  <button
-                    onClick={onSignOut}
-                    style={{
-                      background: 'transparent', border: `1px solid ${T.BORDER}`,
-                      borderRadius: 50, padding: '8px 16px',
-                      fontFamily: MONO, fontSize: 10, letterSpacing: '1.4px',
-                      textTransform: 'uppercase', color: T.MUTED, cursor: 'pointer',
-                      flexShrink: 0, transition: 'border-color 0.2s, color 0.2s',
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = CORAL; e.currentTarget.style.color = CORAL; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = T.BORDER; e.currentTarget.style.color = T.MUTED; }}
-                  >sign out</button>
-                </Row>
-              )}
+                ) : (
+                  <SmallBtn label="reset" onClick={() => setConfirmReset(true)} T={T} />
+                )}
+              </Row>
+            </motion.div>
+          )}
+
+          {tab === 'account' && (
+            <motion.div key="account"
+              initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              style={{ maxWidth: 540 }}
+            >
+              {/* Profile card */}
+              <div style={{
+                background: T.SURFACE, border: `1px solid ${T.BORDER}`, borderRadius: 12,
+                padding: '18px 20px', marginBottom: 24,
+                display: 'flex', alignItems: 'center', gap: 16,
+              }}>
+                <div style={{
+                  width: 44, height: 44, borderRadius: '50%',
+                  background: `${CORAL}33`, border: `2px solid ${CORAL}44`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontFamily: MONO, fontSize: 16, color: CORAL, flexShrink: 0,
+                }}>
+                  {user?.email?.[0]?.toUpperCase() || '?'}
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: T.TEXT, wordBreak: 'break-all' }}>
+                    {user?.email || 'local session'}
+                  </p>
+                  <p style={{ margin: '4px 0 0', fontSize: 11, color: T.MUTED, fontFamily: MONO, letterSpacing: '0.5px' }}>
+                    {user?.app_metadata?.provider || 'email'} · {user?.id?.slice(0, 8) || 'local'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Sign out */}
+              <Row T={T}>
+                <div>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: T.TEXT }}>sign out</p>
+                  <p style={{ margin: '4px 0 0', fontSize: 12, color: T.MUTED }}>
+                    your data stays. you'll need to log back in.
+                  </p>
+                </div>
+                {confirmSignOut ? (
+                  <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                    <SmallBtn label="yes, sign out" onClick={onSignOut} color="#e87a3a" T={T} />
+                    <SmallBtn label="cancel" onClick={() => setConfirmSignOut(false)} T={T} />
+                  </div>
+                ) : (
+                  <SmallBtn label="sign out" onClick={() => setConfirmSignOut(true)} T={T} />
+                )}
+              </Row>
             </motion.div>
           )}
 
@@ -239,6 +295,27 @@ function Row({ children, T }) {
       gap: 20, padding: '16px 0',
       borderBottom: `1px solid ${T.BORDER}`,
     }}>{children}</div>
+  );
+}
+
+function SmallBtn({ label, onClick, color, T }) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        background: 'transparent',
+        border: `1px solid ${hov && color ? color : T.BORDER}`,
+        borderRadius: 50, padding: '8px 16px',
+        fontFamily: MONO, fontSize: 10, letterSpacing: '1.4px',
+        textTransform: 'uppercase',
+        color: hov && color ? color : T.MUTED,
+        cursor: 'pointer', flexShrink: 0,
+        transition: 'border-color 0.2s, color 0.2s',
+      }}
+    >{label}</button>
   );
 }
 
