@@ -45,12 +45,16 @@ export async function fetchMemoryContext(userId, query) {
 // Store conversation in memory after each exchange
 export async function storeConversation(userId, conversationId, messages) {
   try {
-    const formatted = messages.map((m) => ({
-      role: m.role === 'bot' ? 'assistant' : 'user',
-      content: m.text,
-    }));
+    const formatted = messages
+      .map((m) => ({
+        role: m.role === 'bot' ? 'assistant' : 'user',
+        content: typeof m.text === 'string' ? m.text : String(m.text ?? ''),
+      }))
+      // Mem0 rejects empty or whitespace-only content
+      .filter((m) => m.content.trim().length > 0);
 
-    console.log('[MEMORY] Storing conversation:', conversationId, 'for user:', userId);
+    if (formatted.length === 0) return;
+
     const res = await fetch(`${MEM0_BASE}/memories/`, {
       method: 'POST',
       headers: {
@@ -59,11 +63,9 @@ export async function storeConversation(userId, conversationId, messages) {
       },
       body: JSON.stringify({ messages: formatted, user_id: userId }),
     });
-    const data = await res.json();
-    if (res.ok) {
-      console.log('[MEMORY] Conversation stored successfully');
-    } else {
-      console.warn('[MEMORY] Storage failed (chat still works):', data);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      console.warn('[MEMORY] Storage failed (chat still works):', res.status, JSON.stringify(data));
     }
   } catch (e) {
     console.error('[MEMORY] Failed to store conversation:', e.message);

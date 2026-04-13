@@ -29710,6 +29710,72 @@ var require_actions = /* @__PURE__ */ require_chunk.__commonJSMin(((exports, mod
 			requestBody: { message: { raw } }
 		})).data.id };
 	}
+	async function gmailRead({ id }) {
+		const auth = googleAuth.getClient();
+		const msg = await google$1.gmail({
+			version: "v1",
+			auth
+		}).users.messages.get({
+			userId: "me",
+			id,
+			format: "full"
+		});
+		const headers = Object.fromEntries((msg.data.payload?.headers || []).map((h) => [h.name, h.value]));
+		function decodePart(part) {
+			if (!part) return "";
+			if (part.mimeType === "text/plain" && part.body?.data) return Buffer.from(part.body.data, "base64").toString("utf8");
+			if (part.parts) return part.parts.map(decodePart).join("");
+			return "";
+		}
+		const body = decodePart(msg.data.payload) || Buffer.from(msg.data.payload?.body?.data || "", "base64").toString("utf8");
+		return {
+			id: msg.data.id,
+			threadId: msg.data.threadId,
+			from: headers.From,
+			to: headers.To,
+			subject: headers.Subject,
+			date: headers.Date,
+			body: body.slice(0, 6e3)
+		};
+	}
+	async function gmailReply({ threadId, to, subject, body }) {
+		const resolvedTo = await resolveRecipient(to);
+		const auth = googleAuth.getClient();
+		const gmail = google$1.gmail({
+			version: "v1",
+			auth
+		});
+		const lastMsg = (await gmail.users.threads.get({
+			userId: "me",
+			id: threadId,
+			format: "metadata",
+			metadataHeaders: ["Message-ID", "References"]
+		})).data.messages?.slice(-1)[0];
+		const lastHeaders = Object.fromEntries((lastMsg?.payload?.headers || []).map((h) => [h.name, h.value]));
+		const messageId = lastHeaders["Message-ID"] || "";
+		const references = lastHeaders["References"] ? `${lastHeaders["References"]} ${messageId}` : messageId;
+		const lines = [
+			`To: ${resolvedTo}`,
+			`Subject: ${subject.startsWith("Re:") ? subject : `Re: ${subject}`}`,
+			`In-Reply-To: ${messageId}`,
+			`References: ${references}`,
+			`Content-Type: text/plain; charset=utf-8`,
+			"",
+			body || ""
+		];
+		const raw = Buffer.from(lines.join("\r\n")).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+		const res = await gmail.users.messages.send({
+			userId: "me",
+			requestBody: {
+				raw,
+				threadId
+			}
+		});
+		return {
+			id: res.data.id,
+			threadId: res.data.threadId
+		};
+	}
 	async function gmailSearch({ query, max = 10 }) {
 		const auth = googleAuth.getClient();
 		const gmail = google$1.gmail({
@@ -29851,6 +29917,52 @@ var require_actions = /* @__PURE__ */ require_chunk.__commonJSMin(((exports, mod
 			link: `https://docs.google.com/document/d/${created.data.documentId}`
 		};
 	}
+	async function docsRead({ docId }) {
+		const auth = googleAuth.getClient();
+		const doc = await google$1.docs({
+			version: "v1",
+			auth
+		}).documents.get({ documentId: docId });
+		function extractText(elements = []) {
+			return elements.map((el) => {
+				if (el.paragraph) return el.paragraph.elements?.map((e) => e.textRun?.content || "").join("") || "";
+				if (el.table) return el.table.tableRows?.map((r) => r.tableCells?.map((c) => extractText(c.content)).join("	")).join("\n") || "";
+				return "";
+			}).join("");
+		}
+		const text = extractText(doc.data.body?.content || []);
+		return {
+			id: doc.data.documentId,
+			title: doc.data.title,
+			text: text.slice(0, 8e3)
+		};
+	}
+	async function docsEdit({ docId, content, mode = "append" }) {
+		const auth = googleAuth.getClient();
+		const docs = google$1.docs({
+			version: "v1",
+			auth
+		});
+		const endIndex = (await docs.documents.get({ documentId: docId })).data.body?.content?.slice(-1)[0]?.endIndex || 1;
+		const requests = mode === "append" ? [{ insertText: {
+			location: { index: endIndex - 1 },
+			text: "\n" + content
+		} }] : [{ deleteContentRange: { range: {
+			startIndex: 1,
+			endIndex: endIndex - 1
+		} } }, { insertText: {
+			location: { index: 1 },
+			text: content
+		} }];
+		await docs.documents.batchUpdate({
+			documentId: docId,
+			requestBody: { requests }
+		});
+		return {
+			ok: true,
+			docId
+		};
+	}
 	async function sheetsRead({ spreadsheetId, range }) {
 		const auth = googleAuth.getClient();
 		return (await google$1.sheets({
@@ -29860,6 +29972,19 @@ var require_actions = /* @__PURE__ */ require_chunk.__commonJSMin(((exports, mod
 			spreadsheetId,
 			range
 		})).data.values || [];
+	}
+	async function sheetsUpdate({ spreadsheetId, range, values }) {
+		const auth = googleAuth.getClient();
+		await google$1.sheets({
+			version: "v4",
+			auth
+		}).spreadsheets.values.update({
+			spreadsheetId,
+			range,
+			valueInputOption: "USER_ENTERED",
+			requestBody: { values }
+		});
+		return { ok: true };
 	}
 	async function spotifyPlay({ query, uri } = {}) {
 		if (query) {
@@ -29908,11 +30033,35 @@ var require_actions = /* @__PURE__ */ require_chunk.__commonJSMin(((exports, mod
 		return { ok: true };
 	}
 	async function spotifySearch({ query, type = "track" }) {
-		return await spotify.api("/search", { query: {
+		return ((await spotify.api("/search", { query: {
 			q: query,
 			type,
 			limit: 10
-		} });
+		} }))?.[`${type}s`]?.items || []).map((t) => ({
+			name: t.name,
+			uri: t.uri,
+			artist: t.artists?.map((a) => a.name).join(", "),
+			album: t.album?.name
+		}));
+	}
+	async function spotifyGetCurrent() {
+		const data = await spotify.api("/me/player/currently-playing");
+		if (!data || !data.item) return { playing: false };
+		return {
+			playing: data.is_playing,
+			track: data.item.name,
+			artist: data.item.artists?.map((a) => a.name).join(", "),
+			album: data.item.album?.name,
+			progress_ms: data.progress_ms,
+			duration_ms: data.item.duration_ms
+		};
+	}
+	async function spotifyVolume({ volume_percent }) {
+		await spotify.api("/me/player/volume", {
+			method: "PUT",
+			query: { volume_percent }
+		});
+		return { ok: true };
 	}
 	async function slackSend({ channel, text }) {
 		return slack.api("chat.postMessage", {
@@ -29922,6 +30071,35 @@ var require_actions = /* @__PURE__ */ require_chunk.__commonJSMin(((exports, mod
 	}
 	async function slackSearch({ query }) {
 		return slack.api("search.messages", { query });
+	}
+	async function slackRead({ channel, limit = 20 }) {
+		let channelId = channel;
+		if (!channel.startsWith("C") && !channel.startsWith("D") && !channel.startsWith("G")) {
+			const found = ((await slack.api("conversations.list", {
+				types: "public_channel,private_channel,im,mpim",
+				limit: 200
+			})).channels || []).find((c) => c.name === channel.replace(/^#/, "") || c.id === channel);
+			if (!found) throw new Error(`Slack channel not found: ${channel}`);
+			channelId = found.id;
+		}
+		return ((await slack.api("conversations.history", {
+			channel: channelId,
+			limit
+		})).messages || []).map((m) => ({
+			ts: m.ts,
+			user: m.user,
+			text: m.text,
+			bot: !!m.bot_id
+		}));
+	}
+	async function slackStatus({ status_text, status_emoji = ":speech_balloon:", duration_minutes = 0 }) {
+		const expiration = duration_minutes > 0 ? Math.floor(Date.now() / 1e3) + duration_minutes * 60 : 0;
+		await slack.api("users.profile.set", { profile: {
+			status_text,
+			status_emoji,
+			status_expiration: expiration
+		} });
+		return { ok: true };
 	}
 	async function sendExtensionCommand(cmd) {
 		const http = require("http");
@@ -30174,29 +30352,56 @@ Rules:
 		const dueAt = when ? Math.floor(new Date(when).getTime() / 1e3) : null;
 		return { id: db.prepare(`INSERT INTO reminders (text, due_at) VALUES (?, ?)`).run(text, dueAt).lastInsertRowid };
 	}
+	function reminderList({ days = 7 } = {}) {
+		const cutoff = Math.floor(Date.now() / 1e3) + days * 86400;
+		return db.prepare(`SELECT id, text, due_at, done FROM reminders WHERE done = 0 AND (due_at IS NULL OR due_at <= ?) ORDER BY due_at ASC LIMIT 50`).all(cutoff);
+	}
+	function reminderDelete({ id }) {
+		db.prepare(`UPDATE reminders SET done = 1 WHERE id = ?`).run(id);
+		return { ok: true };
+	}
 	function noteCreate({ text }) {
 		return { id: db.prepare(`INSERT INTO notes (text) VALUES (?)`).run(text).lastInsertRowid };
+	}
+	function noteList({ limit = 20 } = {}) {
+		return db.prepare(`SELECT id, text, created_at FROM notes ORDER BY created_at DESC LIMIT ?`).all(limit);
+	}
+	function noteSearch({ query }) {
+		return db.prepare(`SELECT id, text, created_at FROM notes WHERE text LIKE ? ORDER BY created_at DESC LIMIT 20`).all(`%${query}%`);
 	}
 	var HANDLERS = {
 		"gmail.send": gmailSend,
 		"gmail.draft": gmailDraft,
 		"gmail.search": gmailSearch,
+		"gmail.read": gmailRead,
+		"gmail.reply": gmailReply,
 		"gcal.create": gcalCreate,
 		"gcal.list": gcalList,
 		"gcontacts.search": contactsSearch,
 		"gdrive.search": driveSearch,
 		"gdocs.create": docsCreate,
+		"gdocs.read": docsRead,
+		"gdocs.edit": docsEdit,
 		"gsheets.read": sheetsRead,
+		"gsheets.update": sheetsUpdate,
 		"spotify.play": spotifyPlay,
 		"spotify.pause": spotifyPause,
 		"spotify.next": spotifyNext,
 		"spotify.previous": spotifyPrevious,
 		"spotify.queue": spotifyQueue,
 		"spotify.search": spotifySearch,
+		"spotify.get_current": spotifyGetCurrent,
+		"spotify.volume": spotifyVolume,
 		"slack.send": slackSend,
 		"slack.search": slackSearch,
+		"slack.read": slackRead,
+		"slack.status": slackStatus,
 		"reminders.create": reminderCreate,
+		"reminders.list": reminderList,
+		"reminders.delete": reminderDelete,
 		"notes.create": noteCreate,
+		"notes.list": noteList,
+		"notes.search": noteSearch,
 		"browser.open": browserOpen,
 		"browser.search": browserSearch,
 		"browser.whatsapp.dm": browserWhatsappDm,
@@ -30223,6 +30428,110 @@ Rules:
 	module.exports = {
 		execute,
 		HANDLERS
+	};
+}));
+//#endregion
+//#region electron/wsBridge.js
+var require_wsBridge = /* @__PURE__ */ require_chunk.__commonJSMin(((exports, module) => {
+	/**
+	* WebSocket Bridge — Electron main process ↔ Chrome extension
+	*
+	* Replaces the HTTP long-poll /commands system for LangChain tool calls.
+	* Extension connects once; commands flow in both directions synchronously.
+	*
+	* Protocol:
+	*   Main → Extension:  { id, action, payload }
+	*   Extension → Main:  { id, success, data?, error? }
+	*   Extension → Main:  { type: 'tab-info' | 'automate-result', ... }
+	*/
+	var { WebSocketServer } = require_ws();
+	var wss = null;
+	var extensionSocket = null;
+	var pending = /* @__PURE__ */ new Map();
+	var _tabDataCallback = null;
+	function startWsBridge(onTabData) {
+		_tabDataCallback = onTabData;
+		wss = new WebSocketServer({
+			host: "127.0.0.1",
+			port: 7980
+		});
+		wss.on("connection", (ws) => {
+			console.log("[WS-BRIDGE] Extension connected");
+			extensionSocket = ws;
+			ws.on("message", (raw) => {
+				let msg;
+				try {
+					msg = JSON.parse(raw.toString());
+				} catch (e) {
+					return;
+				}
+				if (msg.type === "tab-info" || msg.type === "automate-result" || msg.type === "scroll-activity") {
+					if (_tabDataCallback) _tabDataCallback(msg);
+					return;
+				}
+				if (msg.id && pending.has(msg.id)) {
+					const { resolve, reject, timer } = pending.get(msg.id);
+					pending.delete(msg.id);
+					clearTimeout(timer);
+					if (msg.success) resolve(msg.data ?? {});
+					else reject(new Error(msg.error || "Extension command failed"));
+				}
+			});
+			ws.on("close", () => {
+				console.log("[WS-BRIDGE] Extension disconnected");
+				extensionSocket = null;
+				for (const [, { reject, timer }] of pending) {
+					clearTimeout(timer);
+					reject(/* @__PURE__ */ new Error("Extension disconnected mid-command"));
+				}
+				pending.clear();
+			});
+			ws.on("error", (err) => {
+				console.error("[WS-BRIDGE] Socket error:", err.message);
+			});
+		});
+		wss.on("error", (err) => {
+			console.error("[WS-BRIDGE] Server error:", err.message);
+		});
+		console.log("[WS-BRIDGE] WebSocket bridge started on ws://127.0.0.1:7980");
+	}
+	/**
+	* Send a command to the extension and wait for the response.
+	* Resolves with result data or rejects with an error.
+	*/
+	function sendCommand(action, payload, timeoutMs = 3e4) {
+		return new Promise((resolve, reject) => {
+			if (!extensionSocket || extensionSocket.readyState !== 1) return reject(/* @__PURE__ */ new Error("Chrome extension not connected. Make sure the Thera Bridge extension is installed and Chrome is running."));
+			const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+			const timer = setTimeout(() => {
+				pending.delete(id);
+				reject(/* @__PURE__ */ new Error(`Timeout (${timeoutMs}ms) waiting for extension response to: ${action}`));
+			}, timeoutMs);
+			pending.set(id, {
+				resolve,
+				reject,
+				timer
+			});
+			try {
+				extensionSocket.send(JSON.stringify({
+					id,
+					action,
+					payload
+				}));
+			} catch (e) {
+				pending.delete(id);
+				clearTimeout(timer);
+				reject(/* @__PURE__ */ new Error(`Failed to send command to extension: ${e.message}`));
+			}
+		});
+	}
+	function isConnected() {
+		return extensionSocket !== null && extensionSocket.readyState === 1;
+	}
+	module.exports = {
+		startWsBridge,
+		sendCommand,
+		isConnected
 	};
 }));
 //#endregion
@@ -31446,6 +31755,7 @@ var actions = require_actions();
 var tokenStore = require_tokenStore();
 var { runOAuthFlow } = require_oauthLoopback();
 var bridgeClient = require_bridgeClient();
+var wsBridge = require_wsBridge();
 var mainWindow;
 var widgetWindow;
 var tray;
@@ -31893,6 +32203,20 @@ ipcMain.handle("connectors:slack:disconnect", () => {
 	return { ok: true };
 });
 ipcMain.handle("actions:execute", (_e, action) => actions.execute(action));
+ipcMain.handle("browser:command", async (_e, { action, payload, timeout }) => {
+	try {
+		return {
+			success: true,
+			data: await wsBridge.sendCommand(action, payload, timeout || 3e4)
+		};
+	} catch (err) {
+		console.error("[BROWSER-CMD]", action, "failed:", err.message);
+		return {
+			success: false,
+			error: err.message
+		};
+	}
+});
 ipcMain.handle("mood:log", (_e, entry) => moodOps.log({
 	...entry || {},
 	user_id: currentUserId
@@ -31942,6 +32266,37 @@ ipcMain.handle("screen:capture", async () => {
 			ok: false,
 			error: e.message
 		};
+	}
+});
+ipcMain.handle("system:active-app", async () => {
+	try {
+		const mod = await import("active-win");
+		const win = await (mod.default ?? mod)();
+		if (!win) return null;
+		return {
+			app: win.owner?.name || win.owner?.processName || null,
+			title: win.title || null,
+			url: win.url || null,
+			pid: win.owner?.processId || null
+		};
+	} catch (e) {
+		console.warn("[SYSTEM] active-win failed:", e.message);
+		return null;
+	}
+});
+ipcMain.handle("system:activity-summary", () => {
+	try {
+		const { activityOps } = require_localDb();
+		const recent = activityOps.getRecentActivity(2, currentUserId);
+		if (!recent?.length) return "No recent activity recorded.";
+		const grouped = {};
+		for (const row of recent) {
+			const key = row.app_name || "Unknown";
+			grouped[key] = (grouped[key] || 0) + (row.duration_seconds || 0);
+		}
+		return `Last 2 hours:\n${Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([app, secs]) => `${app}: ${Math.round(secs / 60)} min`).join("\n")}`;
+	} catch (e) {
+		return "Activity data unavailable.";
 	}
 });
 ipcMain.handle("request-permissions", async () => {
@@ -32079,6 +32434,12 @@ app.whenReady().then(() => {
 	createWidgetWindow();
 	createTray();
 	startExtensionBridge();
+	wsBridge.startWsBridge((msg) => {
+		const win = widgetWindow || mainWindow;
+		if (!win) return;
+		if (msg.type === "tab-info") win.webContents.send("extension-tab", msg);
+		else if (msg.type === "automate-result") win.webContents.send("extension-automate-result", msg);
+	});
 	setTimeout(() => {
 		const { startMonitoring } = require_activityMonitor();
 		startMonitoring();

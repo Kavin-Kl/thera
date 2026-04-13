@@ -30,6 +30,7 @@ const actions = require('./connectors/actions');
 const tokenStore = require('./connectors/tokenStore');
 const { runOAuthFlow } = require('./connectors/oauthLoopback');
 const bridgeClient = require('./bridgeClient');
+const wsBridge = require('./wsBridge');
 
 let mainWindow;
 let widgetWindow;
@@ -563,6 +564,19 @@ ipcMain.handle('connectors:slack:disconnect', () => {
 // AI action executor
 ipcMain.handle('actions:execute', (_e, action) => actions.execute(action));
 
+// ── Browser command bridge (LangChain tools → WebSocket → extension) ──────────
+// Tools in src/services/tools/ call this IPC handler to forward commands to
+// the Chrome extension over the WebSocket bridge (wsBridge.js).
+ipcMain.handle('browser:command', async (_e, { action, payload, timeout }) => {
+  try {
+    const data = await wsBridge.sendCommand(action, payload, timeout || 30000);
+    return { success: true, data };
+  } catch (err) {
+    console.error('[BROWSER-CMD]', action, 'failed:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
 // ── Mood ──────────────────────────────────────────────────────
 ipcMain.handle('mood:log', (_e, entry) => moodOps.log({ ...(entry || {}), user_id: currentUserId }));
 ipcMain.handle('mood:daily', (_e, days) => moodOps.daily(days || 30, currentUserId));
@@ -596,6 +610,47 @@ ipcMain.handle('screen:capture', async () => {
   } catch (e) {
     console.error('[SCREEN] capture error:', e.message);
     return { ok: false, error: e.message };
+  }
+});
+
+// ── System context ────────────────────────────────────────────
+// Returns current active desktop window via active-win (ESM, lazy-imported)
+ipcMain.handle('system:active-app', async () => {
+  try {
+    const mod = await import('active-win');
+    const activeWin = mod.default ?? mod;
+    const win = await activeWin();
+    if (!win) return null;
+    return {
+      app:   win.owner?.name || win.owner?.processName || null,
+      title: win.title || null,
+      url:   win.url || null,
+      pid:   win.owner?.processId || null,
+    };
+  } catch (e) {
+    console.warn('[SYSTEM] active-win failed:', e.message);
+    return null;
+  }
+});
+
+// Returns a short summary of recent desktop activity from the activity monitor
+ipcMain.handle('system:activity-summary', () => {
+  try {
+    const { activityOps } = require('./db/localDb');
+    const recent = activityOps.getRecentActivity(2, currentUserId); // last 2 hours
+    if (!recent?.length) return 'No recent activity recorded.';
+    const grouped = {};
+    for (const row of recent) {
+      const key = row.app_name || 'Unknown';
+      grouped[key] = (grouped[key] || 0) + (row.duration_seconds || 0);
+    }
+    const lines = Object.entries(grouped)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([app, secs]) => `${app}: ${Math.round(secs / 60)} min`);
+    return `Last 2 hours:\n${lines.join('\n')}`;
+  } catch (e) {
+    return 'Activity data unavailable.';
   }
 });
 
@@ -740,6 +795,15 @@ app.whenReady().then(() => {
   createWidgetWindow();
   createTray();
   startExtensionBridge();
+
+  // Start WebSocket bridge for LangChain tool commands (port 7980)
+  wsBridge.startWsBridge((msg) => {
+    // Forward unsolicited extension events (tab info, scroll activity) to windows
+    const win = widgetWindow || mainWindow;
+    if (!win) return;
+    if (msg.type === 'tab-info') win.webContents.send('extension-tab', msg);
+    else if (msg.type === 'automate-result') win.webContents.send('extension-automate-result', msg);
+  });
 
   // Start activity monitoring after windows are created
   setTimeout(() => {

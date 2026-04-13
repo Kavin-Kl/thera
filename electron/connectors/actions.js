@@ -156,6 +156,57 @@ async function gmailDraft({ to, subject, body }) {
   return { id: res.data.id };
 }
 
+async function gmailRead({ id }) {
+  const auth = googleAuth.getClient();
+  const gmail = google.gmail({ version: 'v1', auth });
+  const msg = await gmail.users.messages.get({ userId: 'me', id, format: 'full' });
+  const headers = Object.fromEntries((msg.data.payload?.headers || []).map(h => [h.name, h.value]));
+  // Decode body — may be in parts or directly in body
+  function decodePart(part) {
+    if (!part) return '';
+    if (part.mimeType === 'text/plain' && part.body?.data) {
+      return Buffer.from(part.body.data, 'base64').toString('utf8');
+    }
+    if (part.parts) return part.parts.map(decodePart).join('');
+    return '';
+  }
+  const body = decodePart(msg.data.payload) || Buffer.from(msg.data.payload?.body?.data || '', 'base64').toString('utf8');
+  return {
+    id: msg.data.id,
+    threadId: msg.data.threadId,
+    from: headers.From,
+    to: headers.To,
+    subject: headers.Subject,
+    date: headers.Date,
+    body: body.slice(0, 6000),
+  };
+}
+
+async function gmailReply({ threadId, to, subject, body }) {
+  const resolvedTo = await resolveRecipient(to);
+  const auth = googleAuth.getClient();
+  const gmail = google.gmail({ version: 'v1', auth });
+  // Get thread to find the Message-ID to reply to
+  const thread = await gmail.users.threads.get({ userId: 'me', id: threadId, format: 'metadata',
+    metadataHeaders: ['Message-ID', 'References'] });
+  const lastMsg = thread.data.messages?.slice(-1)[0];
+  const lastHeaders = Object.fromEntries((lastMsg?.payload?.headers || []).map(h => [h.name, h.value]));
+  const messageId = lastHeaders['Message-ID'] || '';
+  const references = lastHeaders['References'] ? `${lastHeaders['References']} ${messageId}` : messageId;
+  const lines = [
+    `To: ${resolvedTo}`,
+    `Subject: ${subject.startsWith('Re:') ? subject : `Re: ${subject}`}`,
+    `In-Reply-To: ${messageId}`,
+    `References: ${references}`,
+    `Content-Type: text/plain; charset=utf-8`,
+    '',
+    body || '',
+  ];
+  const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const res = await gmail.users.messages.send({ userId: 'me', requestBody: { raw, threadId } });
+  return { id: res.data.id, threadId: res.data.threadId };
+}
+
 async function gmailSearch({ query, max = 10 }) {
   const auth = googleAuth.getClient();
   const gmail = google.gmail({ version: 'v1', auth });
@@ -288,12 +339,53 @@ async function docsCreate({ title, content }) {
   return { id: created.data.documentId, link: `https://docs.google.com/document/d/${created.data.documentId}` };
 }
 
+async function docsRead({ docId }) {
+  const auth = googleAuth.getClient();
+  const docs = google.docs({ version: 'v1', auth });
+  const doc = await docs.documents.get({ documentId: docId });
+  function extractText(elements = []) {
+    return elements.map(el => {
+      if (el.paragraph) return el.paragraph.elements?.map(e => e.textRun?.content || '').join('') || '';
+      if (el.table) return el.table.tableRows?.map(r => r.tableCells?.map(c => extractText(c.content)).join('\t')).join('\n') || '';
+      return '';
+    }).join('');
+  }
+  const text = extractText(doc.data.body?.content || []);
+  return { id: doc.data.documentId, title: doc.data.title, text: text.slice(0, 8000) };
+}
+
+async function docsEdit({ docId, content, mode = 'append' }) {
+  const auth = googleAuth.getClient();
+  const docs = google.docs({ version: 'v1', auth });
+  const doc = await docs.documents.get({ documentId: docId });
+  const endIndex = doc.data.body?.content?.slice(-1)[0]?.endIndex || 1;
+  const requests = mode === 'append'
+    ? [{ insertText: { location: { index: endIndex - 1 }, text: '\n' + content } }]
+    : [
+        { deleteContentRange: { range: { startIndex: 1, endIndex: endIndex - 1 } } },
+        { insertText: { location: { index: 1 }, text: content } },
+      ];
+  await docs.documents.batchUpdate({ documentId: docId, requestBody: { requests } });
+  return { ok: true, docId };
+}
+
 // ── Sheets ────────────────────────────────────────────────────────
 async function sheetsRead({ spreadsheetId, range }) {
   const auth = googleAuth.getClient();
   const sheets = google.sheets({ version: 'v4', auth });
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range });
   return res.data.values || [];
+}
+
+async function sheetsUpdate({ spreadsheetId, range, values }) {
+  const auth = googleAuth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId, range,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values },
+  });
+  return { ok: true };
 }
 
 // ── Spotify ───────────────────────────────────────────────────────
@@ -321,7 +413,26 @@ async function spotifyQueue({ uri }) {
 }
 async function spotifySearch({ query, type = 'track' }) {
   const data = await spotify.api('/search', { query: { q: query, type, limit: 10 } });
-  return data;
+  const items = data?.[`${type}s`]?.items || [];
+  return items.map(t => ({ name: t.name, uri: t.uri, artist: t.artists?.map(a=>a.name).join(', '), album: t.album?.name }));
+}
+
+async function spotifyGetCurrent() {
+  const data = await spotify.api('/me/player/currently-playing');
+  if (!data || !data.item) return { playing: false };
+  return {
+    playing: data.is_playing,
+    track: data.item.name,
+    artist: data.item.artists?.map(a => a.name).join(', '),
+    album: data.item.album?.name,
+    progress_ms: data.progress_ms,
+    duration_ms: data.item.duration_ms,
+  };
+}
+
+async function spotifyVolume({ volume_percent }) {
+  await spotify.api('/me/player/volume', { method: 'PUT', query: { volume_percent } });
+  return { ok: true };
 }
 
 // ── Slack ─────────────────────────────────────────────────────────
@@ -330,6 +441,25 @@ async function slackSend({ channel, text }) {
 }
 async function slackSearch({ query }) {
   return slack.api('search.messages', { query });
+}
+async function slackRead({ channel, limit = 20 }) {
+  // Resolve channel ID if name given
+  let channelId = channel;
+  if (!channel.startsWith('C') && !channel.startsWith('D') && !channel.startsWith('G')) {
+    const list = await slack.api('conversations.list', { types: 'public_channel,private_channel,im,mpim', limit: 200 });
+    const found = (list.channels || []).find(c => c.name === channel.replace(/^#/, '') || c.id === channel);
+    if (!found) throw new Error(`Slack channel not found: ${channel}`);
+    channelId = found.id;
+  }
+  const res = await slack.api('conversations.history', { channel: channelId, limit });
+  return (res.messages || []).map(m => ({ ts: m.ts, user: m.user, text: m.text, bot: !!m.bot_id }));
+}
+async function slackStatus({ status_text, status_emoji = ':speech_balloon:', duration_minutes = 0 }) {
+  const expiration = duration_minutes > 0 ? Math.floor(Date.now() / 1000) + duration_minutes * 60 : 0;
+  await slack.api('users.profile.set', {
+    profile: { status_text, status_emoji, status_expiration: expiration },
+  });
+  return { ok: true };
 }
 
 // ── Browser automation ────────────────────────────────────────────
@@ -554,38 +684,79 @@ function reminderCreate({ text, when }) {
   const info = db.prepare(`INSERT INTO reminders (text, due_at) VALUES (?, ?)`).run(text, dueAt);
   return { id: info.lastInsertRowid };
 }
+function reminderList({ days = 7 } = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = now + days * 86400;
+  return db.prepare(
+    `SELECT id, text, due_at, done FROM reminders WHERE done = 0 AND (due_at IS NULL OR due_at <= ?) ORDER BY due_at ASC LIMIT 50`
+  ).all(cutoff);
+}
+function reminderDelete({ id }) {
+  db.prepare(`UPDATE reminders SET done = 1 WHERE id = ?`).run(id);
+  return { ok: true };
+}
 function noteCreate({ text }) {
   const info = db.prepare(`INSERT INTO notes (text) VALUES (?)`).run(text);
   return { id: info.lastInsertRowid };
 }
+function noteList({ limit = 20 } = {}) {
+  return db.prepare(`SELECT id, text, created_at FROM notes ORDER BY created_at DESC LIMIT ?`).all(limit);
+}
+function noteSearch({ query }) {
+  return db.prepare(`SELECT id, text, created_at FROM notes WHERE text LIKE ? ORDER BY created_at DESC LIMIT 20`)
+    .all(`%${query}%`);
+}
 
 // ── Dispatcher ────────────────────────────────────────────────────
 const HANDLERS = {
-  'gmail.send': gmailSend,
-  'gmail.draft': gmailDraft,
-  'gmail.search': gmailSearch,
-  'gcal.create': gcalCreate,
-  'gcal.list': gcalList,
+  // Gmail
+  'gmail.send':    gmailSend,
+  'gmail.draft':   gmailDraft,
+  'gmail.search':  gmailSearch,
+  'gmail.read':    gmailRead,
+  'gmail.reply':   gmailReply,
+  // Calendar
+  'gcal.create':   gcalCreate,
+  'gcal.list':     gcalList,
+  // Contacts
   'gcontacts.search': contactsSearch,
+  // Drive
   'gdrive.search': driveSearch,
-  'gdocs.create': docsCreate,
-  'gsheets.read': sheetsRead,
-  'spotify.play': spotifyPlay,
-  'spotify.pause': spotifyPause,
-  'spotify.next': spotifyNext,
-  'spotify.previous': spotifyPrevious,
-  'spotify.queue': spotifyQueue,
-  'spotify.search': spotifySearch,
-  'slack.send': slackSend,
+  // Docs
+  'gdocs.create':  docsCreate,
+  'gdocs.read':    docsRead,
+  'gdocs.edit':    docsEdit,
+  // Sheets
+  'gsheets.read':   sheetsRead,
+  'gsheets.update': sheetsUpdate,
+  // Spotify
+  'spotify.play':        spotifyPlay,
+  'spotify.pause':       spotifyPause,
+  'spotify.next':        spotifyNext,
+  'spotify.previous':    spotifyPrevious,
+  'spotify.queue':       spotifyQueue,
+  'spotify.search':      spotifySearch,
+  'spotify.get_current': spotifyGetCurrent,
+  'spotify.volume':      spotifyVolume,
+  // Slack
+  'slack.send':   slackSend,
   'slack.search': slackSearch,
+  'slack.read':   slackRead,
+  'slack.status': slackStatus,
+  // Built-ins
   'reminders.create': reminderCreate,
-  'notes.create': noteCreate,
-  'browser.open': browserOpen,
-  'browser.search': browserSearch,
-  'browser.whatsapp.dm': browserWhatsappDm,
-  'browser.instagram.dm': browserInstagramDm,
-  'browser.automate': browserAutomate,
-  'browser.ai_task': browserAiTask,
+  'reminders.list':   reminderList,
+  'reminders.delete': reminderDelete,
+  'notes.create':     noteCreate,
+  'notes.list':       noteList,
+  'notes.search':     noteSearch,
+  // Browser automation
+  'browser.open':          browserOpen,
+  'browser.search':        browserSearch,
+  'browser.whatsapp.dm':   browserWhatsappDm,
+  'browser.instagram.dm':  browserInstagramDm,
+  'browser.automate':      browserAutomate,
+  'browser.ai_task':       browserAiTask,
 };
 
 async function execute({ type, params = {} }) {

@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { sendMessageToAI } from "../services/aiService";
-import { processAIResponse } from "../services/actionExecutor";
+import { runAgent, seedHistory } from "../services/agent";
 import { fetchMemoryContext, storeConversation } from "../services/memoryService";
 
 const { ipcRenderer } = window.require ? window.require('electron') : {};
@@ -71,7 +70,6 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
   const [typing,     setTyping]     = useState(false);
   const [screenMode, setScreenMode] = useState(false);
   const bottomRef = useRef(null);
-  const conversationRef = useRef([]);
   const conversationIdRef = useRef(null);
 
   // ── Session loading ────────────────────────────────────────
@@ -100,17 +98,14 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
     setMessages(loaded);
     setActiveChat(id);
     conversationIdRef.current = id;
-    conversationRef.current = loaded.map(m => ({
-      role: m.role === 'bot' ? 'model' : 'user',
-      parts: [{ text: m.text }],
-    }));
+    // Seed LangChain history from DB rows so the agent has full context
+    await seedHistory(id, rows.map(r => ({ role: r.role === 'bot' ? 'assistant' : 'user', text: r.text })));
   };
 
   const startNewSession = async () => {
     setMessages([]);
     setActiveChat(null);
     conversationIdRef.current = null;
-    conversationRef.current = [];
     setDrawer(false);
   };
 
@@ -152,76 +147,46 @@ export default function Home({ dark, setDark, onOpenSettings, userId = 'desktop_
       });
     }
 
-    // Add user message to conversation history
-    conversationRef.current = [
-      ...conversationRef.current,
-      { role: 'user', parts: [{ text }] }
-    ];
-
     try {
-      // Fetch memory context before sending to AI
+      // Fetch Mem0 memory context before sending to AI
       const memoryContext = await fetchMemoryContext(userId, text);
 
-      // Capture screen if screen-aware mode is on (via main process — desktopCapturer is main-only in Electron 20+)
+      // Capture screenshot if screen context mode is active
       let screenshot = null;
       if (screenMode && ipcRenderer) {
         try {
-          const result = await ipcRenderer.invoke('screen:capture');
-          if (result.ok) screenshot = { base64: result.base64, mimeType: result.mimeType };
-          else console.warn('[SCREEN] capture returned error:', result.error);
+          const cap = await ipcRenderer.invoke('screen:capture');
+          if (cap.ok) screenshot = { base64: cap.base64, mimeType: cap.mimeType };
         } catch (e) {
           console.warn('[SCREEN] capture failed:', e.message);
         }
       }
 
-      // Call Gemini API with memory context (+ optional screenshot)
-      const rawBotText = await sendMessageToAI(conversationRef.current, memoryContext, null, screenshot);
+      // Run the LangChain agent — it manages history internally, calls tools
+      // as needed, and returns the final response text.
+      const raw = await runAgent(conversationIdRef.current, text, memoryContext, screenshot);
+      // Guarantee a plain string before touching SQLite or Mem0
+      const botText = typeof raw === 'string' ? raw : String(raw ?? "something went quiet on my end.");
 
-      // Parse + execute any <action>...</action> blocks the AI emitted.
-      // This strips the tags from what the user sees and dispatches each
-      // action (gmail.draft, gmail.send, slack.send, spotify.queue, etc.)
-      // via IPC to the main process.
-      const { displayText, results, resultSummary } = await processAIResponse(rawBotText);
-
-      // What the user actually sees: prose + compact result line(s).
-      const visibleText = results.length > 0
-        ? `${displayText}${displayText ? '\n\n' : ''}${results.map(r => `— ${r.summary}`).join('\n')}`
-        : displayText;
-
-      // What the model sees next turn: its own raw reply (WITH tags so it
-      // remembers what it committed to) followed by a system-style result
-      // line so it can react naturally ("right. drafted. want me to send?")
-      conversationRef.current = [
-        ...conversationRef.current,
-        { role: 'model', parts: [{ text: rawBotText }] },
-      ];
-      if (resultSummary) {
-        // Must alternate roles — add result as user turn then a model ack,
-        // otherwise two consecutive user messages confuse the model into
-        // thinking the next request is already fulfilled.
-        conversationRef.current.push({ role: 'user', parts: [{ text: resultSummary }] });
-        conversationRef.current.push({ role: 'model', parts: [{ text: 'got it.' }] });
-      }
-
-      const updatedMessages = [...newMessages, {
-        id: Date.now() + 1,
-        role: "bot",
-        text: visibleText,
-      }];
-
+      const updatedMessages = [...newMessages, { id: Date.now() + 1, role: "bot", text: botText }];
       setMessages(updatedMessages);
 
-      // Persist bot message (the user-visible version)
+      // Persist bot message
       if (ipcRenderer) {
         ipcRenderer.invoke('sessions:add-message', {
-          sessionId: conversationIdRef.current, role: 'bot', text: visibleText,
+          sessionId: conversationIdRef.current, role: 'bot', text: botText,
         });
       }
-      if (isFirstMessage) refreshSessions();
-      else refreshSessions(); // touch updated_at ordering
+      refreshSessions();
 
-      // Store conversation in memory (async, don't wait)
+      // Store conversation in Mem0 memory (async, don't wait)
       storeConversation(userId, conversationIdRef.current, updatedMessages);
+
+      // Log mood passively — agent injects mood score via log_mood tool itself,
+      // but also fire a baseline neutral tick so the timeline always has data.
+      if (ipcRenderer) {
+        ipcRenderer.invoke('mood:log', { score: 0, source: 'conversation', note: text.slice(0, 120) });
+      }
 
     } catch (error) {
       console.error('Send error:', error);

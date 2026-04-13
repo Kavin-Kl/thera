@@ -16,7 +16,8 @@
       "Bash(identify /Users/nithin/Developer/theranew/thera/thera.png)",
       "Bash(sips -g pixelWidth -g pixelHeight /Users/nithin/Developer/theranew/thera/thera.png)",
       "Bash(node -e \"require\\('@supabase/supabase-js'\\); console.log\\('ok'\\)\")",
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(python3 -c ':*)"
     ],
     "deny": [],
     "ask": []

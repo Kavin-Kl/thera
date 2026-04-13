@@ -938,3 +938,388 @@ async function dispatch(cmd) {
     await reportResult(cmd.taskId, { ok: false, error: 'dispatch error: ' + e.message });
   }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// WebSocket Bridge — LangChain Tool Commands (port 7980)
+//
+// This is the NEW channel used by src/services/tools/* in the Electron renderer.
+// It runs alongside the existing HTTP long-poll system (port 7979) for backward compat.
+//
+// Protocol:
+//   Receive:  { id, action, payload }          e.g. { id:"abc", action:"browser.click", payload:{ selector:"#btn" } }
+//   Send back: { id, success, data }            on success
+//              { id, success: false, error }    on failure
+// ═════════════════════════════════════════════════════════════════════════════
+
+const WS_URL = 'ws://127.0.0.1:7980';
+let wsConn = null;
+let wsReconnectTimer = null;
+
+function connectWsBridge() {
+  if (wsConn && (wsConn.readyState === WebSocket.OPEN || wsConn.readyState === WebSocket.CONNECTING)) return;
+
+  console.log('[WS] Connecting to bridge at', WS_URL);
+  wsConn = new WebSocket(WS_URL);
+
+  wsConn.addEventListener('open', () => {
+    console.log('[WS] Connected to Electron bridge');
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  });
+
+  wsConn.addEventListener('message', async (event) => {
+    let cmd;
+    try { cmd = JSON.parse(event.data); } catch (e) { return; }
+    if (!cmd?.id || !cmd?.action) return;
+
+    console.log('[WS] Command received:', cmd.action, 'id:', cmd.id);
+    try {
+      const data = await wsDispatch(cmd.action, cmd.payload || {});
+      wsReply(cmd.id, true, data);
+    } catch (err) {
+      console.error('[WS] Command failed:', cmd.action, err.message);
+      wsReply(cmd.id, false, null, err.message);
+    }
+  });
+
+  wsConn.addEventListener('close', () => {
+    console.log('[WS] Disconnected — reconnecting in 3s');
+    wsConn = null;
+    wsReconnectTimer = setTimeout(connectWsBridge, 3000);
+  });
+
+  wsConn.addEventListener('error', (err) => {
+    console.warn('[WS] Error:', err.message || err);
+    wsConn?.close();
+  });
+}
+
+function wsReply(id, success, data, error) {
+  if (!wsConn || wsConn.readyState !== WebSocket.OPEN) return;
+  wsConn.send(JSON.stringify(success ? { id, success: true, data: data ?? {} } : { id, success: false, error }));
+}
+
+// ── Helpers (shared with new handlers) ───────────────────────
+
+async function getActiveTab() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs[0]) throw new Error('No active browser tab found');
+  return tabs[0];
+}
+
+// ── Action Handlers ───────────────────────────────────────────
+
+const WS_ACTIONS = {
+
+  // ── Navigation ─────────────────────────────────────────────
+  'browser.navigate': async ({ url }) => {
+    const tab = await getActiveTab();
+    await chrome.tabs.update(tab.id, { url, active: true });
+    await waitForTabLoad(tab.id, 20000);
+    await sleep(500);
+    const updated = await chrome.tabs.get(tab.id);
+    return { title: updated.title, url: updated.url };
+  },
+
+  // ── Click by CSS selector (CDP — real, bot-resistant) ──────
+  'browser.click': async ({ selector, timeout = 5000 }) => {
+    const tab = await getActiveTab();
+    await cdpAttach(tab.id);
+    try {
+      await clickSel(tab.id, selector, timeout);
+      await sleep(200);
+    } finally {
+      await cdpDetach(tab.id);
+    }
+    return {};
+  },
+
+  // ── Click by visible text (CDP evaluate + click) ────────────
+  'browser.click_text': async ({ text, scope }) => {
+    const tab = await getActiveTab();
+    await cdpAttach(tab.id);
+    try {
+      const needle = (text || '').toLowerCase();
+      const scopeSel = scope || 'button,[role="button"],a,[role="link"],span,div,li,label,summary,td';
+      const coord = await evaluate(tab.id, `
+        (function(){
+          const needle = ${JSON.stringify(needle)};
+          const candidates = [...document.querySelectorAll(${JSON.stringify(scopeSel)})];
+          const scored = candidates
+            .map(el => {
+              const t = (el.textContent || '').trim().toLowerCase();
+              if (!t.includes(needle)) return null;
+              const r = el.getBoundingClientRect();
+              if (!r.width || !r.height) return null;
+              return { score: t.length - needle.length, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+            })
+            .filter(Boolean)
+            .sort((a,b) => a.score - b.score);
+          return scored[0] || null;
+        })()
+      `);
+      if (!coord) throw new Error(`No visible element with text: "${text}"`);
+      await cdpClick(tab.id, coord.x, coord.y);
+      await sleep(200);
+    } finally {
+      await cdpDetach(tab.id);
+    }
+    return {};
+  },
+
+  // ── Type text (CDP Input.insertText — works on React/Lexical) ──
+  'browser.type': async ({ selector, text, clear = false, timeout = 5000 }) => {
+    const tab = await getActiveTab();
+    await cdpAttach(tab.id);
+    try {
+      const rect = await waitForRect(tab.id, selector, timeout);
+      await cdpClick(tab.id, rect.x, rect.y);
+      await sleep(150);
+      if (clear) {
+        await cdpClear(tab.id);
+        await sleep(100);
+      }
+      await cdpType(tab.id, text);
+      await sleep(100);
+    } finally {
+      await cdpDetach(tab.id);
+    }
+    return {};
+  },
+
+  // ── Extract text from element or full page ──────────────────
+  'browser.extract': async ({ selector }) => {
+    const tab = await getActiveTab();
+    if (selector) {
+      const result = await sendToTab(tab.id, {
+        type: 'automate-steps',
+        steps: [{ action: 'read', selector }],
+      });
+      return { text: result?.results?.[0]?.value || '' };
+    }
+    // Full page text
+    const result = await sendToTab(tab.id, { type: 'read-page' });
+    return { text: result?.text || '', title: result?.title || '', url: result?.url || '' };
+  },
+
+  // ── Read full page (URL + title + text + interactive elements) ──
+  'browser.read_page': async () => {
+    const tab = await getActiveTab();
+    try {
+      await cdpAttach(tab.id);
+      const info = await evaluate(tab.id, `
+        (function(){
+          const url = location.href;
+          const title = document.title;
+          const text = (document.body?.innerText || '')
+            .replace(/[ \\t]+/g,' ')
+            .replace(/\\n{3,}/g,'\\n\\n')
+            .slice(0, 4000);
+          return { url, title, text };
+        })()
+      `);
+      await cdpDetach(tab.id);
+      return info;
+    } catch (e) {
+      try { await cdpDetach(tab.id); } catch(_) {}
+      // Fallback to content script
+      const result = await sendToTab(tab.id, { type: 'read-page' });
+      return { url: result?.url || tab.url, title: result?.title || tab.title, text: result?.text || '' };
+    }
+  },
+
+  // ── Wait for element (poll until visible) ──────────────────
+  'browser.wait_for': async ({ selector, timeout = 8000 }) => {
+    const tab = await getActiveTab();
+    await cdpAttach(tab.id);
+    try {
+      await waitForRect(tab.id, selector, timeout);
+    } finally {
+      await cdpDetach(tab.id);
+    }
+    return {};
+  },
+
+  // ── Press a keyboard key ────────────────────────────────────
+  'browser.press_key': async ({ key, selector }) => {
+    const tab = await getActiveTab();
+    const result = await sendToTab(tab.id, {
+      type: 'automate-steps',
+      steps: [{ action: 'press', key, selector, optional: false }],
+    });
+    if (!result?.ok) throw new Error(result?.error || 'press_key failed');
+    return {};
+  },
+
+  // ── Scroll page ─────────────────────────────────────────────
+  'browser.scroll': async ({ amount = 400 }) => {
+    const tab = await getActiveTab();
+    await sendToTab(tab.id, {
+      type: 'automate-steps',
+      steps: [{ action: 'scroll', amount }],
+    });
+    return {};
+  },
+
+  // ── WhatsApp DM (existing CDP handler) ─────────────────────
+  'whatsapp.send': async ({ to, message }) => {
+    let waTab = (await chrome.tabs.query({ url: '*://web.whatsapp.com/*' }))[0];
+    if (!waTab) {
+      waTab = await chrome.tabs.create({ url: 'https://web.whatsapp.com', active: true });
+      await waitForTabLoad(waTab.id);
+      await sleep(5000);
+    } else {
+      await chrome.tabs.update(waTab.id, { active: true });
+      await sleep(500);
+    }
+    const result = await cdpWhatsappDm(waTab.id, to, message);
+    if (!result.ok) throw new Error(result.error || 'WhatsApp send failed');
+    return { log: result.log };
+  },
+
+  // ── Instagram DM (existing CDP handler) ────────────────────
+  'instagram.send': async ({ to, message }) => {
+    let igTab = (await chrome.tabs.query({ url: '*://*.instagram.com/*' }))[0];
+    if (!igTab) {
+      const allActive = await chrome.tabs.query({ active: true });
+      igTab = allActive[0] || await chrome.tabs.create({ url: 'https://www.instagram.com', active: true });
+      await waitForTabLoad(igTab.id);
+      await sleep(3000);
+    }
+    const result = await cdpInstagramDm(igTab.id, to, message);
+    if (!result.ok) throw new Error(result.error || 'Instagram send failed');
+    return { log: result.log };
+  },
+
+  // ── Tab management ──────────────────────────────────────────
+  'browser.tab_list': async () => {
+    const tabs = await chrome.tabs.query({});
+    return tabs.map(t => ({ id: t.id, title: t.title, url: t.url, active: t.active, pinned: t.pinned, windowId: t.windowId }));
+  },
+
+  'browser.tab_switch': async ({ id, title, url }) => {
+    let tab;
+    if (id) {
+      tab = await chrome.tabs.get(id);
+    } else if (title || url) {
+      const all = await chrome.tabs.query({});
+      tab = all.find(t =>
+        (title && t.title?.toLowerCase().includes(title.toLowerCase())) ||
+        (url   && t.url?.toLowerCase().includes(url.toLowerCase()))
+      );
+      if (!tab) throw new Error(`No tab matching title="${title}" url="${url}"`);
+    } else {
+      throw new Error('Provide id, title, or url to switch to');
+    }
+    await chrome.tabs.update(tab.id, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    return { id: tab.id, title: tab.title, url: tab.url };
+  },
+
+  'browser.tab_new': async ({ url = 'about:newtab' }) => {
+    const tab = await chrome.tabs.create({ url, active: true });
+    if (url !== 'about:newtab') await waitForTabLoad(tab.id, 15000);
+    return { id: tab.id, url: tab.url };
+  },
+
+  'browser.tab_close': async ({ id, current = false }) => {
+    if (current || !id) {
+      const tab = await getActiveTab();
+      await chrome.tabs.remove(tab.id);
+      return { closed: tab.id };
+    }
+    await chrome.tabs.remove(id);
+    return { closed: id };
+  },
+
+  'browser.tab_pin': async ({ id, pinned = true }) => {
+    let tabId = id;
+    if (!tabId) { const tab = await getActiveTab(); tabId = tab.id; }
+    await chrome.tabs.update(tabId, { pinned });
+    return { id: tabId, pinned };
+  },
+
+  // ── WhatsApp read ───────────────────────────────────────────
+  'whatsapp.read': async ({ contact, limit = 10 }) => {
+    let waTab = (await chrome.tabs.query({ url: '*://web.whatsapp.com/*' }))[0];
+    if (!waTab) throw new Error('WhatsApp Web is not open in any Chrome tab. Ask the user to open it first.');
+    await chrome.tabs.update(waTab.id, { active: true });
+    await sleep(500);
+    await cdpAttach(waTab.id);
+    try {
+      // If contact given, search and open that chat first
+      if (contact) {
+        const searchSel = 'div[contenteditable="true"][data-tab="3"]';
+        const rect = await waitForRect(waTab.id, searchSel, 5000);
+        await cdpClick(waTab.id, rect.x, rect.y);
+        await sleep(200);
+        await cdpClear(waTab.id);
+        await cdpType(waTab.id, contact);
+        await sleep(1500);
+        // Click first result
+        const resultSel = 'div[data-testid="cell-frame-container"]';
+        const resRect = await waitForRect(waTab.id, resultSel, 5000);
+        await cdpClick(waTab.id, resRect.x, resRect.y);
+        await sleep(800);
+      }
+      // Read message bubbles
+      const messages = await evaluate(waTab.id, `
+        (function() {
+          const bubbles = [...document.querySelectorAll('div.message-in, div.message-out')].slice(-${limit});
+          return bubbles.map(b => {
+            const text = b.querySelector('span.selectable-text')?.innerText || '';
+            const time = b.querySelector('span[data-testid="msg-meta"]')?.innerText || '';
+            const out  = b.classList.contains('message-out');
+            return { text, time, direction: out ? 'sent' : 'received' };
+          });
+        })()
+      `);
+      return { messages: messages || [] };
+    } finally {
+      await cdpDetach(waTab.id);
+    }
+  },
+
+  // ── Instagram read ──────────────────────────────────────────
+  'instagram.read': async ({ username, limit = 10 }) => {
+    let igTab = (await chrome.tabs.query({ url: '*://*.instagram.com/direct/*' }))[0]
+              || (await chrome.tabs.query({ url: '*://*.instagram.com/*' }))[0];
+    if (!igTab) throw new Error('Instagram is not open in Chrome. Ask the user to open it first.');
+    // Navigate to DMs
+    await chrome.tabs.update(igTab.id, { url: 'https://www.instagram.com/direct/inbox/', active: true });
+    await waitForTabLoad(igTab.id, 10000);
+    await sleep(2000);
+    await cdpAttach(igTab.id);
+    try {
+      if (username) {
+        // Find and click the conversation with this username
+        const threads = await evaluate(igTab.id, `
+          [...document.querySelectorAll('div[role="listitem"]')].map(el => ({
+            text: el.innerText?.split('\\n')[0] || '',
+            y: el.getBoundingClientRect().top + el.getBoundingClientRect().height/2,
+            x: el.getBoundingClientRect().left + el.getBoundingClientRect().width/2,
+          }))
+        `);
+        const thread = (threads || []).find(t => t.text.toLowerCase().includes(username.toLowerCase()));
+        if (thread) { await cdpClick(igTab.id, thread.x, thread.y); await sleep(1000); }
+      }
+      const messages = await evaluate(igTab.id, `
+        (function() {
+          const items = [...document.querySelectorAll('div[role="row"]')].slice(-${limit});
+          return items.map(el => ({ text: el.innerText?.trim() || '' })).filter(m => m.text);
+        })()
+      `);
+      return { messages: messages || [] };
+    } finally {
+      await cdpDetach(igTab.id);
+    }
+  },
+};
+
+async function wsDispatch(action, payload) {
+  const handler = WS_ACTIONS[action];
+  if (!handler) throw new Error(`Unknown action: "${action}". Available: ${Object.keys(WS_ACTIONS).join(', ')}`);
+  return handler(payload);
+}
+
+// Start WebSocket connection on service worker init
+connectWsBridge();
